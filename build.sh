@@ -8,8 +8,8 @@
 #   - partition 1: FAT32 "BPIWBUILD" - editable CONFIG.TXT
 #                  (Wi-Fi SSID/PSK/COUNTRY/HIDDEN + TIMEZONE)
 #   - partition 2: ext4 root filesystem, with Wi-Fi firmware,
-#                  iwd, and a first-boot provisioning service
-#                  staged into /root
+#                  iwd, first-boot provisioning, and the clock
+#                  hardware layer staged into the image
 #
 # The upstream boot image ships a small placeholder partition
 # (its own file identifies it: PARTITION_INTENTIONALLY_EMPTY.TXT)
@@ -25,12 +25,17 @@
 #   ./build.sh
 #
 # Override any of these via environment variables before running:
-#   BOOT_URL, DEBIAN_URL, OUT_DIR, WORK_DIR, CONFIG_PART_MB
-#
+#   BOOT_URL, DEBIAN_URL, OUT_DIR, WORK_DIR, CONFIG_PART_MB,
+# #
 set -euo pipefail
 
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: build.sh must run as root (mount, apt, depmod)." >&2
+    exit 1
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="$(tr -d '\r\n' < "$HERE/VERSION")"
+VERSION="${BPI_ZERO_CLOCK_VERSION:-1.0.3}"
 
 : "${BOOT_URL:=https://dl.sd-card-images.johang.se/boots/2026-08-01/boot-banana_pi_m2_zero.bin.gz}"
 : "${DEBIAN_URL:=https://dl.sd-card-images.johang.se/debians/2026-08-03/debian-trixie-armhf-ner4uz.bin.gz}"
@@ -257,49 +262,112 @@ fi
 KERNEL_ABI="${KERNEL_ABIS[0]}"
 
 # ------------------------------------------------------------
-# Clock hardware layer: precompiled upstream MAX98357A module
-# plus a final board DTB. The application never compiles kernel
-# code or patches Device Tree on the deployed clock.
+# Clock hardware layer: immutable hardware-validated MAX98357A
+# release artifacts for the exact Debian kernel ABI. Production
+# clocks never compile the codec module or patch Device Tree.
 # ------------------------------------------------------------
-CLOCK_DTB_NAME=sun8i-h2-plus-bananapi-m2-zero.dtb
-CLOCK_DTB="$MNT/usr/lib/firmware/$KERNEL_ABI/device-tree/$CLOCK_DTB_NAME"
-[ -s "$CLOCK_DTB" ] || {
-    echo "ERROR: target BPI-M2 Zero DTB not found: $CLOCK_DTB" >&2
+VALIDATED_ABI="6.12.100+deb13-armmp"
+VALIDATED_MODULE_SHA256="906b7ef831e199a7ae0dc1aa724251ea1763876298cdcd8564a25e70badaa3c6"
+VALIDATED_DTB_SHA256="7d54132d9b707ec62d5b72e08cd329b557a92940664e48164b5b8a8cfd5fcaff"
+VALIDATED_DIR="$HERE/clock/validated/$VALIDATED_ABI"
+CLOCK_DTB_NAME="sun8i-h2-plus-bananapi-m2-zero.dtb"
+MAX98357A_KO="$VALIDATED_DIR/snd-soc-max98357a.ko"
+VALIDATED_DTB="$VALIDATED_DIR/$CLOCK_DTB_NAME"
+
+[ "$KERNEL_ABI" = "$VALIDATED_ABI" ] || {
+    echo "ERROR: bpi-zero-clock $VERSION is validated only for kernel ABI $VALIDATED_ABI." >&2
+    echo "       Image kernel ABI is $KERNEL_ABI." >&2
     exit 1
 }
 
-PREBUILT_DEFAULT="$HERE/clock/prebuilt/$KERNEL_ABI/snd-soc-max98357a.ko"
-MAX98357A_KO="${PREBUILT_MAX98357A_KO:-$PREBUILT_DEFAULT}"
-[ -s "$MAX98357A_KO" ] || {
-    echo "ERROR: prebuilt MAX98357A module is required for $KERNEL_ABI." >&2
-    echo "       Expected: $PREBUILT_DEFAULT" >&2
-    echo "       Build it with clock/build-max98357a.sh or set PREBUILT_MAX98357A_KO." >&2
+for f in "$MAX98357A_KO" "$VALIDATED_DTB"; do
+    [ -s "$f" ] || { echo "ERROR: missing validated release artifact: $f" >&2; exit 1; }
+done
+
+MODULE_SHA256="$(sha256sum "$MAX98357A_KO" | awk '{print $1}')"
+DTB_SHA256="$(sha256sum "$VALIDATED_DTB" | awk '{print $1}')"
+[ "$MODULE_SHA256" = "$VALIDATED_MODULE_SHA256" ] || {
+    echo "ERROR: validated MAX98357A module hash mismatch." >&2
+    echo "       Expected: $VALIDATED_MODULE_SHA256" >&2
+    echo "       Actual:   $MODULE_SHA256" >&2
     exit 1
 }
-if command -v modinfo >/dev/null 2>&1; then
-    MODULE_VERMAGIC="$(modinfo -F vermagic "$MAX98357A_KO" | awk '{print $1}')"
-    [ "$MODULE_VERMAGIC" = "$KERNEL_ABI" ] || {
-        echo "ERROR: MAX98357A module vermagic '$MODULE_VERMAGIC' != '$KERNEL_ABI'." >&2
-        exit 1
-    }
-else
-    MODULE_VERMAGIC="$KERNEL_ABI-unverified-host-no-modinfo"
-fi
+[ "$DTB_SHA256" = "$VALIDATED_DTB_SHA256" ] || {
+    echo "ERROR: validated clock DTB hash mismatch." >&2
+    echo "       Expected: $VALIDATED_DTB_SHA256" >&2
+    echo "       Actual:   $DTB_SHA256" >&2
+    exit 1
+}
 
-CLOCK_DTB_TMP="$WORK_DIR/$CLOCK_DTB_NAME.clock"
-"$HERE/clock/patch-clock-dtb.sh" "$CLOCK_DTB" "$CLOCK_DTB_TMP"
-install -m 0644 "$CLOCK_DTB_TMP" "$CLOCK_DTB"
-rm -f "$CLOCK_DTB_TMP"
+MODULE_VERMAGIC="$(modinfo -F vermagic "$MAX98357A_KO" 2>/dev/null | awk '{print $1}')"
+[ "$MODULE_VERMAGIC" = "$VALIDATED_ABI" ] || {
+    echo "ERROR: MAX98357A vermagic '$MODULE_VERMAGIC' != '$VALIDATED_ABI'." >&2
+    exit 1
+}
+MODULE_NAME="$(modinfo -F name "$MAX98357A_KO" 2>/dev/null || true)"
+[ "$MODULE_NAME" = "snd_soc_max98357a" ] || {
+    echo "ERROR: unexpected validated module name: ${MODULE_NAME:-unknown}" >&2
+    exit 1
+}
+modinfo -F alias "$MAX98357A_KO" 2>/dev/null | grep -q 'maxim,max98357a' || {
+    echo "ERROR: validated module lacks maxim,max98357a OF alias." >&2
+    exit 1
+}
 
-mkdir -p "$MNT/lib/modules/$KERNEL_ABI/extra" \
+dtc -I dtb -O dtb -o /dev/null "$VALIDATED_DTB"
+[ "$(fdtget -t s "$VALIDATED_DTB" /max98357a compatible)" = "maxim,max98357a" ]
+[ "$(fdtget -t x "$VALIDATED_DTB" /max98357a sdmode-delay)" = "5" ]
+[ "$(fdtget -t x "$VALIDATED_DTB" /sound-max98357a simple-audio-card,mclk-fs)" = "100" ]
+! dtc -I dtb -O dts "$VALIDATED_DTB" 2>/dev/null | grep -q 'linux,spdif-dit'
+! dtc -I dtb -O dts "$VALIDATED_DTB" 2>/dev/null | grep -q 'mk-piclock-max98357a-enable-hog'
+
+CLOCK_DTB_OUT="$MNT/usr/lib/firmware/$KERNEL_ABI/device-tree/$CLOCK_DTB_NAME"
+mkdir -p "$(dirname "$CLOCK_DTB_OUT")" \
+             "$MNT/lib/modules/$KERNEL_ABI/extra" \
              "$MNT/etc/modules-load.d" \
              "$MNT/usr/local/sbin" \
              "$MNT/etc/systemd/system/multi-user.target.wants" \
              "$MNT/etc/apt/preferences.d"
+
+install -m 0644 "$VALIDATED_DTB" "$CLOCK_DTB_OUT"
 install -m 0644 "$MAX98357A_KO" \
     "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
-install -m 0644 "$HERE/clock/hardware/bpi-zero-clock.modules" \
-    "$MNT/etc/modules-load.d/bpi-zero-clock.conf"
+
+# PA1 is owned only by the MAX98357A codec driver. Remove every artifact
+# from the retired SPDIF dummy-codec/userspace amp-gate implementation.
+# Keep this as an explicit list so a stale source/image cannot silently carry
+# the old PA1 owner into production.
+LEGACY_AMP_GATE_PATHS=(
+    "$MNT/etc/systemd/system/mk-clock-amp-gate.service"
+    "$MNT/etc/systemd/system/multi-user.target.wants/mk-clock-amp-gate.service"
+    "$MNT/usr/lib/systemd/system/mk-clock-amp-gate.service"
+    "$MNT/lib/systemd/system/mk-clock-amp-gate.service"
+    "$MNT/usr/local/sbin/mk-clock-amp-gate"
+    "$MNT/usr/local/bin/mk-clock-amp-gate"
+    "$MNT/root/mk-clock-amp-gate"
+    "$MNT/etc/modules-load.d/mk-clock-amp-gate.conf"
+)
+rm -f "${LEGACY_AMP_GATE_PATHS[@]}"
+
+# Build invariant: no legacy amp-gate file or symlink may survive. Test both
+# -e and -L so dangling systemd wants symlinks are caught as well.
+for legacy_path in "${LEGACY_AMP_GATE_PATHS[@]}"; do
+    if [ -e "$legacy_path" ] || [ -L "$legacy_path" ]; then
+        echo "ERROR: legacy amp-gate artifact survived image cleanup: ${legacy_path#$MNT}" >&2
+        exit 1
+    fi
+done
+
+cat >"$MNT/etc/modules-load.d/bpi-zero-clock.conf" <<'EOF_MODULES'
+spidev
+i2c-dev
+sun4i-i2s
+snd-soc-max98357a
+snd-soc-simple-card
+hci_uart
+btbcm
+EOF_MODULES
+
 install -m 0755 "$HERE/clock/hardware/mk-piclock-bind-spidev" \
     "$MNT/usr/local/sbin/mk-piclock-bind-spidev"
 install -m 0644 "$HERE/clock/hardware/mk-piclock-spidev.service" \
@@ -308,14 +376,23 @@ ln -sfn ../mk-piclock-spidev.service \
     "$MNT/etc/systemd/system/multi-user.target.wants/mk-piclock-spidev.service"
 install -m 0644 "$HERE/clock/kernel-pin.pref" \
     "$MNT/etc/apt/preferences.d/bpi-zero-clock-kernel.pref"
-if command -v depmod >/dev/null 2>&1; then
-    depmod -b "$MNT" "$KERNEL_ABI"
-else
-    echo "ERROR: depmod is required to install the precompiled amp module." >&2
-    exit 1
-fi
 
-cat >"$MNT/etc/bpi-zero-clock-release" <<EOF
+depmod -b "$MNT" "$KERNEL_ABI"
+
+MODPROBE_CFG="$(modprobe -d "$MNT" -S "$KERNEL_ABI" -n snd-soc-max98357a 2>/dev/null || true)"
+case "$MODPROBE_CFG" in
+    *"/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"*) ;;
+    *)
+        echo "ERROR: depmod/modprobe did not resolve the validated MAX98357A module." >&2
+        echo "       $MODPROBE_CFG" >&2
+        exit 1
+        ;;
+esac
+
+[ "$(sha256sum "$CLOCK_DTB_OUT" | awk '{print $1}')" = "$VALIDATED_DTB_SHA256" ]
+[ "$(sha256sum "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko" | awk '{print $1}')" = "$VALIDATED_MODULE_SHA256" ]
+
+cat >"$MNT/etc/bpi-zero-clock-release" <<EOF_RELEASE
 PRODUCT=bpi-zero-clock
 VERSION=$VERSION
 BASE_PRODUCT=bpi-zero-wbuild
@@ -324,18 +401,31 @@ TARGET=bpi-m2-zero
 KERNEL_ABI=$KERNEL_ABI
 CLOCK_HARDWARE=bpi-m2-zero-r1
 CLOCK_DTB=$CLOCK_DTB_NAME
-MAX98357A_DRIVER=snd-soc-max98357a
-MAX98357A_COMPATIBLE=maxim,max98357a
+AUDIO_ENDPOINT=MAX98357A
+AUDIO_CODEC_DRIVER=snd-soc-max98357a
+AUDIO_CODEC_COMPATIBLE=maxim,max98357a
+AUDIO_DRIVER_SOURCE=hardware-validated-local-build
 MAX98357A_MODULE=/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko
+MAX98357A_MODULE_SHA256=$VALIDATED_MODULE_SHA256
+MAX98357A_DTB_SHA256=$VALIDATED_DTB_SHA256
 MAX98357A_VERMAGIC=$MODULE_VERMAGIC
+MAX98357A_SD_CONTROL=codec-driver-pcm-trigger
+MAX98357A_SD_GPIO=PA1
+MAX98357A_SD_IDLE=low
+MAX98357A_SD_DELAY_MS=5
+MAX98357A_MCLK_FS=256
+AUDIO_VALIDATION=silence-tone-silence-clean-no-pop-no-tail-hiss
+LEGACY_SPDIF_CODEC=removed
+LEGACY_AMP_GATE=removed
+LEGACY_AMP_GATE_FILES=absent-verified
 SPI_DEVICE=/dev/spidev0.0
 I2C_DEVICE=/dev/i2c-0
 HARDWARE_CONFIGURATION=image-owned
 KERNEL_UPDATE_POLICY=image-release-owned
-EOF
+EOF_RELEASE
 chmod 0644 "$MNT/etc/bpi-zero-clock-release"
 
-cat >"$MNT/etc/bpi-zero-wbuild-release" <<EOF
+cat >"$MNT/etc/bpi-zero-wbuild-release" <<EOF_BASE_RELEASE
 PRODUCT=bpi-zero-wbuild
 VERSION=1.2.6
 TARGET=bpi-m2-zero
@@ -350,12 +440,13 @@ NETWORK_IPV4_VERIFIER=ip-or-networkctl
 ROOT_RESIZE_MODE=online-partx-resize2fs
 ROOT_RESIZE_ORDER=before-network
 FIRSTBOOT_REBOOT=none
-EOF
+EOF_BASE_RELEASE
 chmod 0644 "$MNT/etc/bpi-zero-wbuild-release"
 
 sync
 umount "$MNT"
 trap - EXIT
+
 
 # ------------------------------------------------------------
 # 5. Build the BPIWBUILD FAT32 config partition
@@ -381,7 +472,7 @@ python3 "$HERE/scripts/patch_mbr.py" \
 # ------------------------------------------------------------
 # 7. Assemble final image
 # ------------------------------------------------------------
-OUT_IMG="$OUT_DIR/bpi-zero-clock.img"
+OUT_IMG="$OUT_DIR/bpi-zero-clock-$VERSION-bpi-m2-zero.img"
 log "assembling $OUT_IMG"
 cat boot_patched.bin bpiwbuild-config.fat32 debian.bin > "$OUT_IMG"
 

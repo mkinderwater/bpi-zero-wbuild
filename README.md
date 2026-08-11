@@ -1,63 +1,63 @@
-# bpi-zero-clock 1.0.0
+# bpi-zero-clock 1.0.3
 
-Clock-ready Banana Pi M2 Zero image builder derived from the hardware-validated `bpi-zero-wbuild 1.2.6` baseline.
+Clock-ready Banana Pi M2 Zero image builder derived from `bpi-zero-wbuild 1.2.6`.
 
-## Ownership
+## Hardware-validated audio release
 
-`bpi-zero-clock` owns the complete board hardware layer required by mk-clock applications:
+Version 1.0.3 ships the exact MAX98357A module and Device Tree that passed the physical Banana Pi M2 Zero audio test on 2026-08-11.
 
-- the validated BPI-M2 Zero Wi-Fi and AP6212 Bluetooth firmware inherited from 1.2.6;
-- root filesystem expansion before networking, with no resize reboot;
-- SPI0 and `/dev/spidev0.0` for the SSD1322 OLED;
-- I2C0 for the AHT10;
-- I2S0 for the MAX98357A;
-- a precompiled, kernel-matched `snd-soc-max98357a.ko`;
-- the final board DTB using the standard `maxim,max98357a` compatible;
-- PA1 as MAX98357A SD/EN;
-- the spidev binder service;
-- kernel ABI pinning so the external module and DTB remain a tested set.
-
-`mk-clock-adult` becomes application-only. It no longer needs to compile a kernel module, patch a DTB, install kernel headers, or require a hardware-preparation reboot.
-
-## Build model
-
-The amp module is compiled once for the exact kernel ABI in the image and placed under:
+Validated set:
 
 ```text
-clock/prebuilt/<kernel-abi>/snd-soc-max98357a.ko
+Kernel ABI:              6.12.100+deb13-armmp
+MAX98357A module SHA256: 906b7ef831e199a7ae0dc1aa724251ea1763876298cdcd8564a25e70badaa3c6
+Clock DTB SHA256:        7d54132d9b707ec62d5b72e08cd329b557a92940664e48164b5b8a8cfd5fcaff
+I2S0:                    PA18 / PA19 / PA20
+MAX98357A SD/EN:         PA1
+sdmode-delay:            5 ms
+mclk-fs:                 256
+Codec compatible:        maxim,max98357a
 ```
 
-The image builder rejects a module whose vermagic does not match the image ABI.
+The direct playback validation used one second of digital silence, a two-second 440 Hz tone, then one second of digital silence. Playback had no startup pop and no trailing hiss.
 
-Build the module on an ARMv7 system with matching Debian headers, or on a cross-build host with `arm-linux-gnueabihf-gcc`:
+The earlier `linux,spdif-dit` dummy-codec path and `mk-clock-amp-gate` userspace PA1 control are retired. PA1 is owned by `snd_soc_max98357a` through `sdmode-gpios`.
 
-```bash
-./clock/build-max98357a.sh \
-  6.12.100+deb13-armmp \
-  /usr/src/linux-headers-6.12.100+deb13-armmp
+## Release model
+
+The validated module and DTB are immutable release artifacts under:
+
+```text
+clock/validated/6.12.100+deb13-armmp/
 ```
 
-Then build the image:
+`build.sh` verifies the kernel ABI, module vermagic, OF alias, module SHA256 and DTB SHA256. The build stops if any part of the tested set differs.
+
+The image continues to inherit the `bpi-zero-wbuild 1.2.6` Wi-Fi, board-qualified AP6212 Bluetooth firmware, and online root-filesystem resize behavior. Bluetooth userspace remains application-owned.
+
+## Build
+
+On a Linux build host:
 
 ```bash
 sudo ./build.sh
 ```
 
-The exact ABI is derived from the rootfs and is not guessed. If the module for that ABI is missing, the image build stops.
-
-## Release verification
-
-The finished image must satisfy:
+Output:
 
 ```text
-/etc/bpi-zero-wbuild-release        base = 1.2.6
-/etc/bpi-zero-clock-release         product = bpi-zero-clock 1.0.0
-DTB root marker                     bpi-zero-clock,hardware = bpi-m2-zero-r1
-/max98357a compatible               maxim,max98357a
-snd-soc-max98357a.ko vermagic       exact image kernel ABI
-/dev/spidev0.0                      created after boot
-/dev/i2c-0                          present
-ALSA MAX98357A card                  present
-AP6212 Wi-Fi                         retained
-AP6212 Bluetooth firmware            retained
+out/bpi-zero-clock-1.0.3-bpi-m2-zero.img
+out/bpi-zero-clock-1.0.3-bpi-m2-zero.img.gz
 ```
+
+## Expected runtime audio state
+
+```text
+snd_soc_max98357a loaded
+snd_soc_spdif_tx absent
+ALSA card: MAX98357A
+PCM: 1c22000.i2s-HiFi HiFi-0
+mk-clock-amp-gate inactive/absent
+```
+
+The clock application owns userspace application packages. The image owns the board/kernel hardware layer.

@@ -4,7 +4,7 @@ import re
 import subprocess
 
 root = Path(__file__).resolve().parents[1]
-assert (root / "VERSION").read_text().strip() == "1.0.0"
+assert (root / "VERSION").read_text().strip() == "1.0.3"
 
 build = (root / "build.sh").read_text()
 firstboot = (root / "overlay/root/bpi-zero-wbuild-firstboot.sh").read_text()
@@ -12,9 +12,7 @@ firstboot = (root / "overlay/root/bpi-zero-wbuild-firstboot.sh").read_text()
 for p in [
     root / "build.sh",
     root / "overlay/root/bpi-zero-wbuild-firstboot.sh",
-    root / "clock/build-max98357a.sh",
-    root / "clock/patch-clock-dtb.sh",
-    root / "clock/hardware/mk-piclock-bind-spidev",
+        root / "clock/hardware/mk-piclock-bind-spidev",
 ]:
     result = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
     assert result.returncode == 0, f"shell syntax error in {p}: {result.stderr}"
@@ -51,7 +49,7 @@ assert 'BASE_VERSION=1.2.6' in build
 assert 'PRODUCT=bpi-zero-wbuild' in build
 assert 'VERSION=1.2.6' in build
 assert 'HARDWARE_CONFIGURATION=clock-image-owned' in build
-assert 'OUT_IMG="$OUT_DIR/bpi-zero-clock.img"' in build
+assert 'OUT_IMG="$OUT_DIR/bpi-zero-clock-$VERSION-bpi-m2-zero.img"' in build
 
 # Cache/checksum behavior remains from validated builder.
 assert "rm -rf pkgroot" in build
@@ -60,4 +58,4 @@ assert '[ "$cached_url" = "$url" ]' in build
 assert 'sha256sum "$(basename "$OUT_IMG")"' in build
 assert 'sha256sum "$(basename "$OUT_IMG").gz"' in build
 
-print("bpi-zero-clock 1.0.0 inherited-builder checks passed")
+print("bpi-zero-clock 1.0.3 inherited-builder checks passed")

@@ -1,0 +1,10 @@
+filename:       /root/max98357a-GOOD-6.12.100+deb13-armmp/snd-soc-max98357a.ko
+license:        GPL v2
+description:    Maxim MAX98357A Codec Driver
+alias:          of:N*T*Cmaxim,max98360aC*
+alias:          of:N*T*Cmaxim,max98360a
+alias:          of:N*T*Cmaxim,max98357aC*
+alias:          of:N*T*Cmaxim,max98357a
+depends:        snd-soc-core
+name:           snd_soc_max98357a
+vermagic:       6.12.100+deb13-armmp SMP mod_unload modversions ARMv7 p2v8 

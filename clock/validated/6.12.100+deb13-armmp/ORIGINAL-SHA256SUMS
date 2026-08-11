@@ -1,0 +1,4 @@
+906b7ef831e199a7ae0dc1aa724251ea1763876298cdcd8564a25e70badaa3c6  /root/max98357a-GOOD-6.12.100+deb13-armmp/snd-soc-max98357a.ko
+75b251c2eaa9aa03ae18bea9a1d134308ab8e882bde3f08523ca9f1d55797d54  /root/max98357a-GOOD-6.12.100+deb13-armmp/max98357a.c
+d33afa500c8d0207a179f05095e3f453c6a9fcb6d70f41cb57bb196fd62b25f9  /root/max98357a-GOOD-6.12.100+deb13-armmp/Makefile
+7d54132d9b707ec62d5b72e08cd329b557a92940664e48164b5b8a8cfd5fcaff  /root/max98357a-GOOD-6.12.100+deb13-armmp/sun8i-h2-plus-bananapi-m2-zero.dtb
