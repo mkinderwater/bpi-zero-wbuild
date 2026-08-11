@@ -1,0 +1,7 @@
+spidev
+i2c-dev
+sun4i-i2s
+snd-soc-max98357a
+snd-soc-simple-card
+hci_uart
+btbcm

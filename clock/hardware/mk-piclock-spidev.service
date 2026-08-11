@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind mk-clock OLED SPI device to spidev
+After=systemd-modules-load.service
+Before=mk-piclock-core.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mk-piclock-bind-spidev
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

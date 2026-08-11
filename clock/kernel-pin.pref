@@ -1,0 +1,5 @@
+# bpi-zero-clock ships a kernel-matched external audio module and DTB.
+# Kernel ABI transitions are released as a new tested clock image.
+Package: linux-image-armmp linux-headers-armmp
+Pin: version *
+Pin-Priority: -1
