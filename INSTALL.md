@@ -1,42 +1,53 @@
-# bpi-zero-clock 1.0.3 installation
+# bpi-zero-clock 1.0.4-preview25 installation
 
-1. Build the image on Linux with `sudo ./build.sh`, or use the released compressed image.
-2. Flash `bpi-zero-clock-1.0.3-bpi-m2-zero.img` to the microSD card.
-3. Edit `CONFIG.TXT` on the `BPIWBUILD` partition for Wi-Fi and timezone settings.
-4. Boot the Banana Pi M2 Zero and allow first-boot provisioning to finish.
-5. Install `mk-clock-adult` as the application layer.
+1. Run `sudo ./build.sh` on Debian 13 armhf or amd64.
+2. Flash `out/bpi-zero-clock-1.0.4-preview25-bpi-m2-zero.img` or `.img.gz`.
+3. Edit `CONFIG.TXT` on the FAT32 `BPIWBUILD` partition.
+4. Boot once and allow firstboot to complete.
+5. Confirm Wi-Fi reports `Power save: off`.
+6. Install the matching `mk-clock-adult` release.
 
-The image already contains the clock hardware layer: SPI0, I2C0, I2S0, the hardware-validated MAX98357A codec module and final DTB. No application-side kernel module compilation or Device Tree patch is required.
+## Audio field check
 
-## Default login
-
-First-boot provisioning sets these accounts. Both are live the moment the board finishes provisioning and comes up on the network you gave it in `CONFIG.TXT`, SSH included.
-
-| Account | Password | Shell | Notes |
-|:--|:--|:--|:--|
-| `root` | `bpi-zero-wbuild` | — | direct root login |
-| `bpi-zero-wbuild` | `bpi-zero-wbuild` | `/bin/bash` | regular user, home directory created |
-
-Hostname is also set to `bpi-zero-wbuild` at first boot.
-
-**Change these passwords right after first boot, before you trust this board on any network you care about.** The same password is used for both accounts, it's the same on every image this builder produces, and SSH host keys are generated and SSH comes up automatically as part of first-boot provisioning — so a default-credential board on your Wi-Fi is reachable the moment it's on the network, not just over a console cable. Once you're logged in:
+No microphone validator is installed in the production image. Standard Debian ALSA utilities remain available.
 
 ```bash
-passwd root
-passwd bpi-zero-wbuild
+arecord -l
+arecord -D hw:0,1 --dump-hw-params \
+  -t raw -f S32_LE -c 2 -r 24000 -d 1 /dev/null 2>&1
 ```
 
-Verify audio after boot:
-
-```bash
-cat /etc/bpi-zero-clock-release
-lsmod | grep snd_soc_max98357a
-cat /proc/asound/cards
-cat /proc/asound/pcm
-```
-
-Expected PCM endpoint:
+Expected rate capability:
 
 ```text
-1c22000.i2s-HiFi HiFi-0
+RATE: 24000
+```
+
+A 48000 Hz `arecord` request may warn and negotiate down to 24000 Hz; that is expected. The hardware parameter dump is authoritative.
+
+With a microphone attached:
+
+```bash
+arecord -D hw:0,1 -t raw -f S32_LE -c 2 -r 24000 -d 5 /tmp/mic.raw
+wc -c /tmp/mic.raw
+```
+
+Five seconds should produce `960000` bytes.
+
+## Network checks
+
+```bash
+ip -br addr show wlan0
+ip route
+iw dev wlan0 link
+iw dev wlan0 get power_save
+```
+
+Expected power state: `Power save: off`.
+
+## Logs
+
+```text
+/var/log/bpi-zero-wbuild-firstboot.log
+/var/log/bpi-zero-wbuild-packages.log
 ```

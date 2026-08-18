@@ -1,0 +1,14 @@
+[Unit]
+Description=Volatile /tmp for mk-clock appliance
+Documentation=man:tmpfs(5) man:systemd.mount(5)
+Before=local-fs.target
+Conflicts=umount.target
+
+[Mount]
+What=tmpfs
+Where=/tmp
+Type=tmpfs
+Options=mode=1777,nosuid,nodev,noatime,size=64M
+
+[Install]
+WantedBy=local-fs.target

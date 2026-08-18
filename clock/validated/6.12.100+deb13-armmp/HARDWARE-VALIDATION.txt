@@ -1,0 +1,37 @@
+bpi-zero-clock hardware validation
+==================================
+
+Target: Banana Pi M2 Zero
+Kernel ABI: 6.12.100+deb13-armmp
+
+Playback baseline
+-----------------
+MAX98357A module SHA256:
+906b7ef831e199a7ae0dc1aa724251ea1763876298cdcd8564a25e70badaa3c6
+
+Playback hardware validation: 2026-08-11
+- PA18 LRCLK, PA19 BCLK, PA20 DOUT
+- PA1 MAX98357A SD/EN, codec-owned, 5 ms delay
+- mclk-fs 256
+- silence -> 440 Hz tone -> silence
+- clean start/stop, no startup pop, no trailing hiss
+
+Capture clock/DMA validation
+----------------------------
+Validated DTB SHA256:
+0ff283cc75acd93a43722769e3d9771dcb5d629825348593fdd4da605e4b1452
+
+Hardware confirmation: 2026-08-17
+- PA18 LRCLK, PA19 BCLK, PA21 DIN
+- generic dmic-codec, 2 x 32-bit slots
+- capture mclk-fs 256
+- ALSA hardware rate exactly 24000 Hz
+- live stream S32_LE, 2 channels, 24000 Hz, RUNNING
+- 1 second capture: 192000 bytes, exit 0
+- 10 second capture: 1920000 bytes, exit 0
+- prior oversample 4166 / hw_params -EINVAL eliminated
+- no microphone was connected during clock/ALSA/DMA validation
+
+Pending
+-------
+Physical ICS-43434 signal, channel/SEL behavior, amplitude/noise floor and speech quality.
