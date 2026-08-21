@@ -1,6 +1,5 @@
 [Unit]
 Description=bpi-zero-wbuild one-time provisioning
-ConditionPathExists=!/var/lib/bpi-zero-wbuild-firstboot.done
 After=local-fs.target systemd-udev-trigger.service
 
 [Service]

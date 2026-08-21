@@ -16,7 +16,8 @@
 # that the SoC's boot process does not use. This build drops it
 # entirely rather than carrying it forward -- see scripts/patch_mbr.py.
 #
-# Requirements: bash, python3, ar, tar, curl or wget, gzip.
+# Requirements: bash, python3, ar, tar, curl or wget, gzip, unzip,
+# ca-certificates (usable /etc/ssl/certs/ca-certificates.crt).
 # No mkfs.vfat/mtools/fdisk/parted required -- the FAT32
 # partition and MBR partition table are built by hand in
 # scripts/make_fat32.py and this script.
@@ -35,10 +36,11 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${BPI_ZERO_CLOCK_VERSION:-1.0.4-preview25}"
+VERSION="${BPI_ZERO_CLOCK_VERSION:-1.0.4-preview36}"
 
 : "${BOOT_URL:=https://dl.sd-card-images.johang.se/boots/2026-08-01/boot-banana_pi_m2_zero.bin.gz}"
-: "${DEBIAN_URL:=https://dl.sd-card-images.johang.se/debians/2026-08-03/debian-trixie-armhf-ner4uz.bin.gz}"
+: "${DEBIAN_URL:=https://dl.sd-card-images.johang.se/debians/2026-08-17/debian-trixie-armhf-eiy3bo.bin.gz}"
+DEBIAN_GZIP_SHA256="8cca0fed789a76fef8fb7c8c18bf46ed4d362f9e84d91ffecfe6674e9713c94f"
 : "${FIRMWARE_DEB_URL:=https://ftp.debian.org/debian/pool/non-free-firmware/f/firmware-nonfree/firmware-brcm80211_20250410-2_all.deb}"
 : "${IWD_DEB_URL:=https://deb.debian.org/debian/pool/main/i/iwd/iwd_3.8-2_armhf.deb}"
 : "${LIBELL_DEB_URL:=https://deb.debian.org/debian/pool/main/e/ell/libell0_0.77-1_armhf.deb}"
@@ -93,14 +95,17 @@ command -v gzip >/dev/null 2>&1 || MISSING_HOST_PKGS+=(gzip)
 command -v xz >/dev/null 2>&1 || MISSING_HOST_PKGS+=(xz-utils)
 command -v dtc >/dev/null 2>&1 || MISSING_HOST_PKGS+=(device-tree-compiler)
 command -v fdtget >/dev/null 2>&1 || MISSING_HOST_PKGS+=(device-tree-compiler)
+command -v fdtput >/dev/null 2>&1 || MISSING_HOST_PKGS+=(device-tree-compiler)
 command -v depmod >/dev/null 2>&1 || MISSING_HOST_PKGS+=(kmod)
 command -v modinfo >/dev/null 2>&1 || MISSING_HOST_PKGS+=(kmod)
 command -v e2fsck >/dev/null 2>&1 || MISSING_HOST_PKGS+=(e2fsprogs)
 command -v tune2fs >/dev/null 2>&1 || MISSING_HOST_PKGS+=(e2fsprogs)
-command -v mkimage >/dev/null 2>&1 || MISSING_HOST_PKGS+=(u-boot-tools)
+command -v unzip >/dev/null 2>&1 || MISSING_HOST_PKGS+=(unzip)
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     MISSING_HOST_PKGS+=(curl)
 fi
+# HTTPS downloads require a usable CA trust bundle. Do not weaken TLS with -k.
+[ -s /etc/ssl/certs/ca-certificates.crt ] || MISSING_HOST_PKGS+=(ca-certificates)
 
 if [ "${#MISSING_HOST_PKGS[@]}" -gt 0 ]; then
     log "installing missing host dependencies: ${MISSING_HOST_PKGS[*]}"
@@ -108,6 +113,21 @@ if [ "${#MISSING_HOST_PKGS[@]}" -gt 0 ]; then
     DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
         apt-get install -y --no-install-recommends "${MISSING_HOST_PKGS[@]}"
 fi
+
+# A package may already be installed while its generated bundle is missing.
+# Rebuild it once, then fail closed before any HTTPS fetch if trust is unusable.
+if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+    command -v update-ca-certificates >/dev/null 2>&1 || {
+        echo "ERROR: ca-certificates is unavailable; HTTPS downloads cannot be verified." >&2
+        exit 1
+    }
+    log "regenerating HTTPS CA certificate bundle"
+    update-ca-certificates >/dev/null
+fi
+[ -s /etc/ssl/certs/ca-certificates.crt ] || {
+    echo "ERROR: HTTPS CA certificate bundle unavailable: /etc/ssl/certs/ca-certificates.crt" >&2
+    exit 1
+}
 
 fetch() {
     local url="$1" dest="$2"
@@ -178,6 +198,13 @@ fetch_gzip() {
 # ------------------------------------------------------------
 fetch_gzip "$BOOT_URL" boot.bin.gz
 fetch_gzip "$DEBIAN_URL" debian.bin.gz
+[ "$(sha256sum debian.bin.gz | awk '{print $1}')" = "$DEBIAN_GZIP_SHA256" ] || {
+    echo "ERROR: Debian root image SHA256 mismatch." >&2
+    echo "       Expected: $DEBIAN_GZIP_SHA256" >&2
+    echo "       Actual:   $(sha256sum debian.bin.gz | awk '{print $1}')" >&2
+    exit 1
+}
+log "Debian root image SHA256 verified"
 
 log "decompressing boot/root images"
 gunzip -k -f boot.bin.gz
@@ -243,13 +270,6 @@ BOARD_TXT="$FW_DIR/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt"
 for f in "$CYPRESS_BIN" "$CYPRESS_CLM" "$BOARD_TXT"; do
     [ -s "$f" ] || { echo "ERROR: missing firmware payload $f"; exit 1; }
 done
-mkdir -p pkgroot
-cp -f "$CYPRESS_BIN" "pkgroot/brcmfmac43430-sdio.bin"
-cp -f "$CYPRESS_BIN" "pkgroot/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.bin"
-cp -f "$CYPRESS_CLM" "pkgroot/brcmfmac43430-sdio.clm_blob"
-cp -f "$CYPRESS_CLM" "pkgroot/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.clm_blob"
-cp -f "$BOARD_TXT" "pkgroot/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt"
-
 log "extracting regulatory.db from wireless-regdb"
 extract_deb_data pkgroot/wireless-regdb_2026.05.30-1~deb13u1_all.deb _regdb_extract
 REGDB="_regdb_extract/usr/lib/firmware/regulatory.db-upstream"
@@ -257,9 +277,6 @@ REGSIG="_regdb_extract/usr/lib/firmware/regulatory.db.p7s-upstream"
 for f in "$REGDB" "$REGSIG"; do
     [ -s "$f" ] || { echo "ERROR: missing regulatory payload $f"; exit 1; }
 done
-cp -f "$REGDB" pkgroot/regulatory.db
-cp -f "$REGSIG" pkgroot/regulatory.db.p7s
-
 log "fetching hardware-validated Banana Pi AP6212 Bluetooth HCD"
 fetch "$BT_HCD_URL" bpi-ap6212-bcm43438a1.hcd
 [ "$(stat -c %s bpi-ap6212-bcm43438a1.hcd)" -eq 33376 ] || {
@@ -268,24 +285,24 @@ fetch "$BT_HCD_URL" bpi-ap6212-bcm43438a1.hcd
 }
 BT_FIRMWARE_SOURCE="BananaPi-AP6212-${BPI_WIFI_COMMIT}-board-specific"
 
-rm -rf _fw_extract _regdb_extract
-
 # ------------------------------------------------------------
 # 3. Stage the overlay into pkgroot
 # ------------------------------------------------------------
-# Stage the one-shot firstboot helper, explicitly excluding obsolete runtime
-# Bluetooth and historical resize-repair helpers from older source trees.
-for src in "$HERE"/overlay/root/*.sh "$HERE"/overlay/root/*.service; do
+# Stage only the one-shot firstboot script into /root. The systemd unit is
+# installed directly under /etc/systemd/system below, so a duplicate /root copy
+# has no runtime purpose. Build-cache *.source-url metadata is also build-host
+# state and must never enter the appliance rootfs.
+for src in "$HERE"/overlay/root/*.sh; do
     [ -e "$src" ] || continue
     case "$(basename "$src")" in
-        bpi-zero-wbuild-btfirmware.sh|bpi-zero-wbuild-btfirmware.service) continue ;;
+        bpi-zero-wbuild-btfirmware.sh) continue ;;
     esac
     cp -f "$src" pkgroot/
 done
+find pkgroot -maxdepth 1 -type f -name '*.source-url' -delete
 
 chmod 755 pkgroot/*.sh
-chmod 644 pkgroot/*.service pkgroot/regulatory.db* \
-    pkgroot/brcmfmac43430-sdio* pkgroot/*.deb
+chmod 644 pkgroot/*.deb
 
 # ------------------------------------------------------------
 # 4. Inject pkgroot into /root and install the first-boot unit.
@@ -305,6 +322,13 @@ mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants" "$MNT/etc"
 cp -f "$HERE/overlay/root/bpi-zero-wbuild-firstboot.service" \
     "$MNT/etc/systemd/system/bpi-zero-wbuild-firstboot.service"
 
+# Field diagnostics are image-owned and remain available even if firstboot fails.
+mkdir -p "$MNT/usr/local/sbin" "$MNT/etc/issue.d"
+install -m 0755 "$HERE/overlay/usr/local/sbin/bpi-zero-diag" \
+    "$MNT/usr/local/sbin/bpi-zero-diag"
+printf '%s\n' 'bpi-zero-clock \n' 'wlan0 IPv4: \4{wlan0}' \
+    >"$MNT/etc/issue.d/90-bpi-zero-clock.conf"
+
 # Keep the base image on a single first-boot provisioning path.
 # Bluetooth firmware is embedded directly, and root growth completes online.
 rm -f \
@@ -317,13 +341,25 @@ rm -f \
     "$MNT/root/bpi-zero-wbuild-resizefs.service" \
     "$MNT/root/bpi-zero-wbuild-resizefs.sh"
 
+# Wi-Fi firmware is image-owned. Install the exact extracted payloads directly
+# into the rootfs so firstboot never stages/copies firmware or reloads brcmfmac
+# merely to make image contents available.
+mkdir -p "$MNT/usr/lib/firmware/brcm"
+install -m 0644 "$REGDB" "$MNT/usr/lib/firmware/regulatory.db"
+install -m 0644 "$REGSIG" "$MNT/usr/lib/firmware/regulatory.db.p7s"
+install -m 0644 "$CYPRESS_BIN" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.bin"
+install -m 0644 "$CYPRESS_BIN" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.bin"
+install -m 0644 "$CYPRESS_CLM" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.clm_blob"
+install -m 0644 "$CYPRESS_CLM" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.clm_blob"
+install -m 0644 "$BOARD_TXT" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt"
+
 # Install ONLY the board-qualified AP6212 HCD name validated on BPI-M2-Zero.
 # Do not install a generic BCM43430A1.hcd fallback: the Debian generic payload
 # produced UART baud/reset timeouts on this hardware.
-mkdir -p "$MNT/usr/lib/firmware/brcm"
 rm -f "$MNT/usr/lib/firmware/brcm/BCM43430A1.hcd"
 install -m 0644 bpi-ap6212-bcm43438a1.hcd \
     "$MNT/usr/lib/firmware/brcm/BCM43430A1.sinovoip,bpi-m2-zero.hcd"
+rm -rf _fw_extract _regdb_extract
 
 ln -sfn ../bpi-zero-wbuild-firstboot.service \
     "$MNT/etc/systemd/system/multi-user.target.wants/bpi-zero-wbuild-firstboot.service"
@@ -337,78 +373,73 @@ fi
 KERNEL_ABI="${KERNEL_ABIS[0]}"
 
 # ------------------------------------------------------------
-# Clock hardware layer: immutable preview audio artifacts for the exact
-# Debian kernel ABI. MAX98357A playback remains the physically validated
-# 1.0.3 path; this preview DTB adds PA21 I2S DIN and an ICS-43434 capture
-# endpoint for target validation. Deployed clocks never patch Device Tree.
+# Clock hardware layer: playback-only MAX98357A on Debian 6.12.101.
+# The codec source and hardware topology are the proven 1.0.3 playback path,
+# rebuilt for the exact new kernel ABI. The DTB is patched from the stock
+# 6.12.101 Banana Pi DTB so unrelated upstream DT changes are retained.
 # ------------------------------------------------------------
-VALIDATED_ABI="6.12.100+deb13-armmp"
-VALIDATED_MODULE_SHA256="906b7ef831e199a7ae0dc1aa724251ea1763876298cdcd8564a25e70badaa3c6"
-VALIDATED_DTB_SHA256="0ff283cc75acd93a43722769e3d9771dcb5d629825348593fdd4da605e4b1452"
-VALIDATED_DIR="$HERE/clock/validated/$VALIDATED_ABI"
+EXPECTED_ABI="6.12.101+deb13-armmp"
 CLOCK_DTB_NAME="sun8i-h2-plus-bananapi-m2-zero.dtb"
-MAX98357A_KO="$VALIDATED_DIR/snd-soc-max98357a.ko"
-VALIDATED_DTB="$VALIDATED_DIR/$CLOCK_DTB_NAME"
+STOCK_DTB="$MNT/usr/lib/linux-image-$KERNEL_ABI/$CLOCK_DTB_NAME"
+CLOCK_BUILD_DIR="$WORK_DIR/clock-playback"
+CLOCK_DTB_BUILD="$CLOCK_BUILD_DIR/$CLOCK_DTB_NAME"
+MAX98357A_BUILD_DIR="$CLOCK_BUILD_DIR/max98357a"
 
-[ "$KERNEL_ABI" = "$VALIDATED_ABI" ] || {
-    echo "ERROR: bpi-zero-clock $VERSION is validated only for kernel ABI $VALIDATED_ABI." >&2
+[ "$KERNEL_ABI" = "$EXPECTED_ABI" ] || {
+    echo "ERROR: bpi-zero-clock $VERSION requires kernel ABI $EXPECTED_ABI." >&2
     echo "       Image kernel ABI is $KERNEL_ABI." >&2
     exit 1
 }
+[ -s "$STOCK_DTB" ] || {
+    echo "ERROR: stock 6.12.101 Banana Pi DTB missing: ${STOCK_DTB#$MNT}" >&2
+    exit 1
+}
 
-for f in "$MAX98357A_KO" "$VALIDATED_DTB"; do
-    [ -s "$f" ] || { echo "ERROR: missing validated release artifact: $f" >&2; exit 1; }
-done
+rm -rf "$CLOCK_BUILD_DIR"
+mkdir -p "$CLOCK_BUILD_DIR" "$MAX98357A_BUILD_DIR"
 
+log "patching stock 6.12.101 DTB for playback-only clock hardware"
+"$HERE/scripts/patch_playback_dtb.sh" "$STOCK_DTB" "$CLOCK_DTB_BUILD"
+DTB_SHA256="$(sha256sum "$CLOCK_DTB_BUILD" | awk '{print $1}')"
+
+log "building MAX98357A codec module for $KERNEL_ABI"
+MK_MAX98357A_BUILD_OUT="$MAX98357A_BUILD_DIR" \
+    "$HERE/scripts/build_max98357a_module.sh"
+MAX98357A_KO="$MAX98357A_BUILD_DIR/snd-soc-max98357a.ko"
+[ -s "$MAX98357A_KO" ] || { echo "ERROR: MAX98357A build output missing." >&2; exit 1; }
 MODULE_SHA256="$(sha256sum "$MAX98357A_KO" | awk '{print $1}')"
-DTB_SHA256="$(sha256sum "$VALIDATED_DTB" | awk '{print $1}')"
-[ "$MODULE_SHA256" = "$VALIDATED_MODULE_SHA256" ] || {
-    echo "ERROR: validated MAX98357A module hash mismatch." >&2
-    echo "       Expected: $VALIDATED_MODULE_SHA256" >&2
-    echo "       Actual:   $MODULE_SHA256" >&2
-    exit 1
-}
-[ "$DTB_SHA256" = "$VALIDATED_DTB_SHA256" ] || {
-    echo "ERROR: validated clock DTB hash mismatch." >&2
-    echo "       Expected: $VALIDATED_DTB_SHA256" >&2
-    echo "       Actual:   $DTB_SHA256" >&2
-    exit 1
-}
-
 MODULE_VERMAGIC="$(modinfo -F vermagic "$MAX98357A_KO" 2>/dev/null | awk '{print $1}')"
-[ "$MODULE_VERMAGIC" = "$VALIDATED_ABI" ] || {
-    echo "ERROR: MAX98357A vermagic '$MODULE_VERMAGIC' != '$VALIDATED_ABI'." >&2
+[ "$MODULE_VERMAGIC" = "$KERNEL_ABI" ] || {
+    echo "ERROR: MAX98357A vermagic '$MODULE_VERMAGIC' != '$KERNEL_ABI'." >&2
     exit 1
 }
-MODULE_NAME="$(modinfo -F name "$MAX98357A_KO" 2>/dev/null || true)"
-[ "$MODULE_NAME" = "snd_soc_max98357a" ] || {
-    echo "ERROR: unexpected validated module name: ${MODULE_NAME:-unknown}" >&2
+[ "$(modinfo -F name "$MAX98357A_KO" 2>/dev/null)" = "snd_soc_max98357a" ] || {
+    echo "ERROR: unexpected MAX98357A module name." >&2
     exit 1
 }
 modinfo -F alias "$MAX98357A_KO" 2>/dev/null | grep -q 'maxim,max98357a' || {
-    echo "ERROR: validated module lacks maxim,max98357a OF alias." >&2
+    echo "ERROR: MAX98357A module lacks maxim,max98357a OF alias." >&2
     exit 1
 }
 
-dtc -I dtb -O dtb -o /dev/null "$VALIDATED_DTB"
-[ "$(fdtget -t s "$VALIDATED_DTB" /max98357a compatible)" = "maxim,max98357a" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" /max98357a sdmode-delay)" = "5" ]
-[ "$(fdtget -t s "$VALIDATED_DTB" /dmic-codec compatible)" = "dmic-codec" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" /dmic-codec num-channels)" = "2" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" /sound-max98357a icubedev,capture-rate-hz)" = "5dc0" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" '/sound-max98357a/simple-audio-card,dai-link@0' mclk-fs)" = "100" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" '/sound-max98357a/simple-audio-card,dai-link@1' mclk-fs)" = "100" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" '/sound-max98357a/simple-audio-card,dai-link@0' reg)" = "0" ]
-[ "$(fdtget -t x "$VALIDATED_DTB" '/sound-max98357a/simple-audio-card,dai-link@1' reg)" = "1" ]
-I2S_PINS="$(fdtget -t s "$VALIDATED_DTB" /soc/pinctrl@1c20800/mk-piclock-i2s0-pins pins)"
-[ "$I2S_PINS" = "PA18 PA19 PA20 PA21" ] || {
-    echo "ERROR: preview I2S pin set is '$I2S_PINS', expected PA18 PA19 PA20 PA21." >&2
+[ "$(fdtget -t s "$CLOCK_DTB_BUILD" /max98357a compatible)" = "maxim,max98357a" ]
+[ "$(fdtget -t x "$CLOCK_DTB_BUILD" /max98357a sdmode-delay)" = "5" ]
+[ "$(fdtget -t s "$CLOCK_DTB_BUILD" /sound-max98357a simple-audio-card,name)" = "MAX98357A" ]
+[ "$(fdtget -t x "$CLOCK_DTB_BUILD" /sound-max98357a simple-audio-card,mclk-fs)" = "100" ]
+I2S_PINS="$(fdtget -t s "$CLOCK_DTB_BUILD" /soc/pinctrl@1c20800/mk-piclock-i2s0-pins pins)"
+[ "$I2S_PINS" = "PA18 PA19 PA20" ] || {
+    echo "ERROR: playback I2S pin set is '$I2S_PINS', expected PA18 PA19 PA20." >&2
     exit 1
 }
-! dtc -I dtb -O dts "$VALIDATED_DTB" 2>/dev/null | grep -q 'linux,spdif-dit'
-! dtc -I dtb -O dts "$VALIDATED_DTB" 2>/dev/null | grep -q 'mk-piclock-max98357a-enable-hog'
+DT_DTS="$(dtc -I dtb -O dts "$CLOCK_DTB_BUILD" 2>/dev/null)"
+printf '%s\n' "$DT_DTS" | grep -q 'maxim,max98357a'
+! printf '%s\n' "$DT_DTS" | grep -q 'dmic-codec'
+! printf '%s\n' "$DT_DTS" | grep -q 'icubedev,capture-rate-hz'
+! printf '%s\n' "$DT_DTS" | grep -q 'PA21'
+! printf '%s\n' "$DT_DTS" | grep -q 'linux,spdif-dit'
 
 CLOCK_DTB_OUT="$MNT/usr/lib/firmware/$KERNEL_ABI/device-tree/$CLOCK_DTB_NAME"
+CLOCK_DTB_BOOT="$MNT/usr/lib/linux-image-$KERNEL_ABI/$CLOCK_DTB_NAME"
 mkdir -p "$(dirname "$CLOCK_DTB_OUT")" \
              "$MNT/lib/modules/$KERNEL_ABI/extra" \
              "$MNT/etc/modules-load.d" \
@@ -419,7 +450,10 @@ mkdir -p "$(dirname "$CLOCK_DTB_OUT")" \
              "$MNT/etc/systemd/system.conf.d" \
              "$MNT/etc/apt/preferences.d"
 
-install -m 0644 "$VALIDATED_DTB" "$CLOCK_DTB_OUT"
+# extlinux loads the DTB from /usr/lib/linux-image-$ABI; keep the firmware copy
+# too because diagnostics and the application verifier use it as a stable path.
+install -m 0644 "$CLOCK_DTB_BUILD" "$CLOCK_DTB_BOOT"
+install -m 0644 "$CLOCK_DTB_BUILD" "$CLOCK_DTB_OUT"
 install -m 0644 "$MAX98357A_KO" \
     "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
 
@@ -458,8 +492,8 @@ install -m 0644 "$HERE/clock/hardware/mk-piclock-spidev.service" \
 ln -sfn ../mk-piclock-spidev.service \
     "$MNT/etc/systemd/system/multi-user.target.wants/mk-piclock-spidev.service"
 
-# Native ALSA default routing for the two-link sound card. The asym plugin
-# selects hardware PCMs only; no plug/rate conversion is introduced.
+# Native ALSA default routing for playback only. No capture PCM, plug, rate
+# conversion, dmix or dsnoop is introduced.
 install -m 0644 "$HERE/clock/hardware/asound.conf" "$MNT/etc/asound.conf"
 
 # 24/7 appliance endurance/recovery policy. Journald is explicitly volatile and
@@ -484,96 +518,58 @@ install -m 0644 "$HERE/clock/kernel-pin.pref" \
 # protocol-managed by OpenSSH and unrelated AcceptEnv entries are preserved.
 python3 "$HERE/scripts/disable_ssh_locale_forwarding.py" --root "$MNT"
 
-# Appliance boot-console policy. The upstream Debian rootfs boots through
-# /boot/boot.scr generated from /boot/boot.cmd. Patch the active command and
-# its initramfs post-update generator so future kernel updates retain the same
-# quiet kernel policy, then rebuild boot.scr immediately for this image.
-BOOT_CMD="$MNT/boot/boot.cmd"
-BOOT_SCR="$MNT/boot/boot.scr"
-BOOT_UPDATE_HOOK="$MNT/etc/initramfs/post-update.d/zz-update-uimg"
-for f in "$BOOT_CMD" "$BOOT_UPDATE_HOOK"; do
-    [ -s "$f" ] || { echo "ERROR: required boot policy file missing: ${f#$MNT}" >&2; exit 1; }
-done
-python3 "$HERE/scripts/set_boot_loglevel.py" "$BOOT_CMD" "$BOOT_UPDATE_HOOK"
-mkimage -A arm -T script -C none -d "$BOOT_CMD" "$BOOT_SCR" >/dev/null
-chmod 0644 "$BOOT_SCR"
-grep -Eq '^setenv[[:space:]]+bootargs[[:space:]]+quiet[[:space:]]+loglevel=3([[:space:]]|$)' "$BOOT_CMD" || {
-    echo "ERROR: quiet loglevel=3 not present in active boot command." >&2
+# Appliance boot policy. The 2026-08-17 Debian rootfs uses U-Boot extlinux,
+# not the old boot.cmd/boot.scr path. Pin root to our final MBR partition 2,
+# keep the console quiet, and eliminate the interactive five-second boot menu.
+EXTLINUX_CONF="$MNT/boot/extlinux/extlinux.conf"
+U_BOOT_DEFAULTS="$MNT/etc/default/u-boot"
+[ -s "$EXTLINUX_CONF" ] || { echo "ERROR: extlinux.conf missing from new Debian rootfs." >&2; exit 1; }
+ROOT_PARTUUID="$(python3 "$HERE/scripts/mbr_partuuid.py" boot.bin --partition 2)"
+python3 "$HERE/scripts/set_extlinux_policy.py" \
+    "$EXTLINUX_CONF" "$U_BOOT_DEFAULTS" --partuuid "$ROOT_PARTUUID"
+grep -Eq "^[[:space:]]*append root=PARTUUID=${ROOT_PARTUUID}[[:space:]]+rw[[:space:]]+rootwait[[:space:]]+quiet[[:space:]]+loglevel=4$" "$EXTLINUX_CONF" || {
+    echo "ERROR: extlinux root/quiet policy was not applied." >&2
     exit 1
 }
+grep -Eq '^prompt[[:space:]]+0$' "$EXTLINUX_CONF"
+grep -Eq '^timeout[[:space:]]+10$' "$EXTLINUX_CONF"
 
-# Build the capture stack from exact Debian 6.12.100-1 source and headers.
-# There is no binary module editing in this release. The source patch set:
-#   1. adds the already-supported 24 kHz bit to sun4i-i2s capture only;
-#   2. keeps generic dmic.c unmodified;
-#   3. adds a local simple-card capture constraint keyed by the DT property.
-AUDIO_MODULE_OUT="$WORK_DIR/audio-modules"
-MK_AUDIO_BUILD_WORK="$WORK_DIR/audio-source" \
-MK_AUDIO_BUILD_OUT="$AUDIO_MODULE_OUT" \
-    "$HERE/scripts/build_audio_modules.sh"
-
-I2S_KO="$(find "$MNT/lib/modules/$KERNEL_ABI" -type f -name 'sun4i-i2s.ko.xz' -print -quit)"
-SIMPLE_CARD_KO="$(find "$MNT/lib/modules/$KERNEL_ABI" -type f -name 'snd-soc-simple-card.ko.xz' -print -quit)"
-for f in "$I2S_KO" "$SIMPLE_CARD_KO"; do
-    [ -s "$f" ] || { echo "ERROR: required stock ASoC module missing: $f" >&2; exit 1; }
-done
-
-KERNEL_CONFIG="$MNT/boot/config-$KERNEL_ABI"
-[ -s "$KERNEL_CONFIG" ] || { echo "ERROR: target kernel config missing: $KERNEL_CONFIG" >&2; exit 1; }
-grep -qx '# CONFIG_MODULE_SIG_FORCE is not set' "$KERNEL_CONFIG" || {
-    echo "ERROR: target kernel enforces signed modules; local source-built modules cannot be used." >&2
-    exit 1
-}
-
-# Source-built replacements are unsigned and use the exact target Module.symvers.
-# Replace the two existing modules in place so modprobe cannot resolve a stale copy.
-install -m 0644 "$AUDIO_MODULE_OUT/sun4i-i2s.ko.xz" "$I2S_KO"
-install -m 0644 "$AUDIO_MODULE_OUT/snd-soc-simple-card.ko.xz" "$SIMPLE_CARD_KO"
-DMIC_KO="$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-dmic.ko.xz"
-install -m 0644 "$AUDIO_MODULE_OUT/snd-soc-dmic.ko.xz" "$DMIC_KO"
-
-I2S_MODULE_SHA256="$(sha256sum "$I2S_KO" | awk '{print $1}')"
-DMIC_MODULE_SHA256="$(sha256sum "$DMIC_KO" | awk '{print $1}')"
-SIMPLE_CARD_MODULE_SHA256="$(sha256sum "$SIMPLE_CARD_KO" | awk '{print $1}')"
-
+# Playback-only release: retain Debian stock I2S/simple-card and install only
+# the MAX98357A codec rebuilt for this exact kernel ABI.
 depmod -b "$MNT" "$KERNEL_ABI"
 
-# Validate the depmod index resolves each appliance module to the exact file we
-# installed, then ask modprobe to validate that the module plus its dependencies
-# are resolvable. Do not parse `modprobe -n` stdout: it is intentionally silent
-# unless verbose mode is requested.
 validate_module_resolution() {
     local mod="$1"
-    local expected="$2"
+    local expected="${2:-}"
     local resolved
-
     resolved="$(modinfo -b "$MNT" -k "$KERNEL_ABI" -n "$mod" 2>/dev/null || true)"
-    if [ "$resolved" != "$expected" ]; then
-        echo "ERROR: depmod index resolved $mod to '${resolved:-<none>}', expected '$expected'." >&2
+    [ -n "$resolved" ] || { echo "ERROR: target kernel cannot resolve $mod." >&2; exit 1; }
+    if [ -n "$expected" ] && [ "$resolved" != "$expected" ]; then
+        echo "ERROR: depmod index resolved $mod to '$resolved', expected '$expected'." >&2
         exit 1
     fi
-
-    if ! modprobe -d "$MNT" -S "$KERNEL_ABI" -n "$mod" >/dev/null 2>&1; then
-        echo "ERROR: target kernel cannot resolve $mod or one of its dependencies." >&2
+    modprobe -d "$MNT" -S "$KERNEL_ABI" -n "$mod" >/dev/null 2>&1 || {
+        echo "ERROR: target kernel cannot resolve $mod or dependencies." >&2
         exit 1
-    fi
-
-    echo ">> module resolution OK: $mod -> ${expected#$MNT}"
+    }
+    echo ">> module resolution OK: $mod -> ${resolved#$MNT}"
 }
 
-validate_module_resolution snd-soc-max98357a     "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
-validate_module_resolution sun4i-i2s "$I2S_KO"
-validate_module_resolution snd-soc-dmic "$DMIC_KO"
-validate_module_resolution snd-soc-simple-card "$SIMPLE_CARD_KO"
+validate_module_resolution snd-soc-max98357a "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
+validate_module_resolution sun4i-i2s
+validate_module_resolution snd-soc-simple-card
 
-[ "$(sha256sum "$CLOCK_DTB_OUT" | awk '{print $1}')" = "$VALIDATED_DTB_SHA256" ]
-[ "$(sha256sum "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko" | awk '{print $1}')" = "$VALIDATED_MODULE_SHA256" ]
+# Capture must not be preloaded or image-owned in the playback-only release.
+! grep -q '^snd-soc-dmic$' "$MNT/etc/modules-load.d/bpi-zero-clock.conf"
+[ "$(sha256sum "$CLOCK_DTB_OUT" | awk '{print $1}')" = "$DTB_SHA256" ]
+[ "$(sha256sum "$CLOCK_DTB_BOOT" | awk '{print $1}')" = "$DTB_SHA256" ]
+[ "$(sha256sum "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko" | awk '{print $1}')" = "$MODULE_SHA256" ]
 
 cat >"$MNT/etc/bpi-zero-clock-release" <<EOF_RELEASE
 PRODUCT=bpi-zero-clock
 VERSION=$VERSION
 BASE_PRODUCT=bpi-zero-wbuild
-BASE_VERSION=1.2.6
+BASE_VERSION=1.2.7
 TARGET=bpi-m2-zero
 SSH_CLIENT_LOCALE_FORWARDING=disabled
 LOCALE_PACKAGES=not-installed
@@ -581,63 +577,39 @@ KERNEL_ABI=$KERNEL_ABI
 CLOCK_HARDWARE=bpi-m2-zero-r1
 CLOCK_DTB=$CLOCK_DTB_NAME
 AUDIO_ENDPOINT=MAX98357A
+AUDIO_MODE=playback-only
 AUDIO_CODEC_DRIVER=snd-soc-max98357a
 AUDIO_CODEC_COMPATIBLE=maxim,max98357a
-AUDIO_DRIVER_SOURCE=playback-validated-capture-source-built-clock-dma-hardware-confirmed
+AUDIO_DRIVER_SOURCE=hardware-validated-source-rebuilt-for-6.12.101
 MAX98357A_MODULE=/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko
-MAX98357A_MODULE_SHA256=$VALIDATED_MODULE_SHA256
-MAX98357A_DTB_SHA256=$VALIDATED_DTB_SHA256
+MAX98357A_MODULE_SHA256=$MODULE_SHA256
+MAX98357A_DTB_SHA256=$DTB_SHA256
 MAX98357A_VERMAGIC=$MODULE_VERMAGIC
 MAX98357A_SD_CONTROL=codec-driver-pcm-trigger
 MAX98357A_SD_GPIO=PA1
 MAX98357A_SD_IDLE=low
 MAX98357A_SD_DELAY_MS=5
 MAX98357A_MCLK_FS=256
-AUDIO_CAPTURE_ENDPOINT=ICS-43434
-AUDIO_CAPTURE_CODEC=dmic-codec
-AUDIO_CAPTURE_DRIVER=snd-soc-dmic
-AUDIO_CAPTURE_DRIVER_SOURCE=debian-6.12.100-1-unmodified-dmic-source
-AUDIO_CAPTURE_MODULE=${DMIC_KO#$MNT}
-AUDIO_CAPTURE_MODULE_SHA256=$DMIC_MODULE_SHA256
-AUDIO_CAPTURE_FORMAT=S32_LE
-AUDIO_CAPTURE_RATE_HZ=24000
-AUDIO_CAPTURE_CHANNELS=2
-AUDIO_CAPTURE_SLOT_WIDTH_BITS=32
-AUDIO_CAPTURE_MCLK_FS=256
-AUDIO_CAPTURE_SOFT_RESAMPLE=disabled
-AUDIO_CAPTURE_DEFAULT_PCM=default-asym-to-hw-MAX98357A-device1
-I2S_DRIVER=sun4i-i2s
-I2S_DRIVER_SOURCE=debian-6.12.100-1-plus-capture-24khz-capability-patch
-I2S_MODULE=${I2S_KO#$MNT}
-I2S_MODULE_SHA256=$I2S_MODULE_SHA256
-MACHINE_AUDIO_DRIVER=snd-soc-simple-card
-MACHINE_AUDIO_DRIVER_SOURCE=debian-6.12.100-1-plus-local-capture-rate-policy-patch
-MACHINE_AUDIO_MODULE=${SIMPLE_CARD_KO#$MNT}
-MACHINE_AUDIO_MODULE_SHA256=$SIMPLE_CARD_MODULE_SHA256
-MACHINE_CAPTURE_POLICY=snd_pcm_hw_constraint_list
-MACHINE_CAPTURE_RATE_HZ=24000
-MACHINE_CAPTURE_DT_PROPERTY=icubedev,capture-rate-hz
-APPLICATION_AUDIO_BASELINE=mk-clock-adult-2.3.50-preview25
+AUDIO_CAPTURE=removed
+APPLICATION_AUDIO_BASELINE=mk-clock-adult-2.3.50-preview34
 I2S_LRCLK_GPIO=PA18
 I2S_BCLK_GPIO=PA19
 I2S_TX_GPIO=PA20
-I2S_RX_GPIO=PA21
-MIC_DATA_GPIO=PA21
-MIC_HEADER_PIN=38
+I2S_RX_GPIO=unassigned
+I2S_RX_HEADER_PIN=38-free
 TOUCH_GPIO=PA17
 TOUCH_HEADER_PIN=37
-AUDIO_CAPTURE_VALIDATION=clock-dma-hardware-confirmed-24khz-mic-signal-pending
-AUDIO_VALIDATION=silence-tone-silence-clean-no-pop-no-tail-hiss
+AUDIO_VALIDATION=playback-topology-hardware-confirmed-on-6.12.100-kernel-6.12.101-target-validation-required
 LEGACY_SPDIF_CODEC=removed
 LEGACY_AMP_GATE=removed
 LEGACY_AMP_GATE_FILES=absent-verified
 KERNEL_BOOT_QUIET=yes
-KERNEL_CONSOLE_LOGLEVEL=3
+KERNEL_CONSOLE_LOGLEVEL=4
 JOURNAL_STORAGE=volatile
 JOURNAL_RUNTIME_MAX_USE=16M
 TMP_MOUNT=tmpfs-64M
-SYSTEMD_RUNTIME_WATCHDOG_SEC=30s
-SYSTEMD_REBOOT_WATCHDOG_SEC=2min
+SYSTEMD_RUNTIME_WATCHDOG_SEC=16s
+SYSTEMD_REBOOT_WATCHDOG_SEC=16s
 SPI_DEVICE=/dev/spidev0.0
 I2C_DEVICE=/dev/i2c-0
 HARDWARE_CONFIGURATION=image-owned
@@ -651,21 +623,30 @@ WIFI_POWER_SAVE_POLICY=iwd-DriverQuirks-PowerSaveDisable-brcmfmac
 FIRSTBOOT_RESUME=checkpointed
 WIFI_RECOVERY_RETRY=one-controlled-radio-userspace-restart
 FIRSTBOOT_CONSOLE_LOGGING=stage-summary
+FIELD_DIAGNOSTICS=bpi-zero-diag
+LOGIN_IPV4_DISPLAY=agetty-issue-wlan0
+CPU_DIAGNOSTIC_POLICY=observe-no-governor-or-opp-change
+MACHINE_ID_POLICY=firstboot-systemd-machine-id-setup
+DEBCONF_FRONTEND_POLICY=persistent-Noninteractive-after-DHCP
 EOF_RELEASE
 chmod 0644 "$MNT/etc/bpi-zero-clock-release"
 
 cat >"$MNT/etc/bpi-zero-wbuild-release" <<EOF_BASE_RELEASE
 PRODUCT=bpi-zero-wbuild
-VERSION=1.2.6
+VERSION=1.2.7
 TARGET=bpi-m2-zero
-BASE=debian-trixie-armhf
+BASE=debian-trixie-armhf-eiy3bo
 KERNEL_ABI=$KERNEL_ABI
 WIFI_FIRMWARE_SOURCE=Debian-firmware-brcm80211-20250410-2
+WIFI_FIRMWARE_INSTALL=image-build-direct
 BLUETOOTH_FIRMWARE_SOURCE=$BT_FIRMWARE_SOURCE
 BLUETOOTH_FIRMWARE_PATH=brcm/BCM43430A1.sinovoip,bpi-m2-zero.hcd
 BLUETOOTH_USERSPACE=application-owned
 HARDWARE_CONFIGURATION=clock-image-owned
 NETWORK_IPV4_VERIFIER=iproute2
+FIELD_DIAGNOSTICS=bpi-zero-diag
+LOGIN_IPV4_DISPLAY=agetty-issue-wlan0
+CPU_DIAGNOSTIC_POLICY=observe-no-governor-or-opp-change
 CLI_NETWORK_TOOL=iproute2-6.15.0-1
 CLI_WIFI_TOOL=iw-6.9-1
 WIFI_POWER_SAVE_POLICY=iwd-DriverQuirks-PowerSaveDisable-brcmfmac
@@ -674,10 +655,23 @@ WIFI_RECOVERY_RETRY=one-controlled-radio-userspace-restart
 ROOT_RESIZE_MODE=firstboot-online-resize2fs-fail-closed
 ROOT_RESIZE_ORDER=before-network
 ROOT_FS_BUILD_VALIDATION=e2fsck-read-only-clean-required
+MACHINE_ID_POLICY=firstboot-systemd-machine-id-setup
+DEBCONF_FRONTEND_POLICY=persistent-Noninteractive-after-DHCP
 ROOT_FS_REPAIR=none
 FIRSTBOOT_REBOOT=none
 EOF_BASE_RELEASE
 chmod 0644 "$MNT/etc/bpi-zero-wbuild-release"
+
+# Clone-safe machine identity. Normalize the upstream rootfs regardless of
+# whether it ships /etc/machine-id absent, empty, or populated. Every flashed
+# clock must generate its own persistent identity. Leave /etc/machine-id
+# present but empty. Firstboot Stage 05 explicitly runs
+# systemd-machine-id-setup, and the legacy D-Bus path references that same ID.
+log "resetting image machine-id for first-boot generation"
+mkdir -p "$MNT/var/lib/dbus"
+truncate -s 0 "$MNT/etc/machine-id"
+rm -f "$MNT/var/lib/dbus/machine-id"
+ln -s /etc/machine-id "$MNT/var/lib/dbus/machine-id"
 
 sync
 umount "$MNT"

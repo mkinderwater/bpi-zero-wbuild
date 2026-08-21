@@ -1,0 +1,76 @@
+#!/bin/bash
+set -u
+
+section() {
+    printf '\n=== %s ===\n' "$1"
+}
+
+value_or() {
+    local path="$1" fallback="${2:-UNKNOWN}"
+    if [ -r "$path" ]; then
+        cat "$path"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+section "IDENTITY"
+printf 'Hostname:     %s\n' "$(hostname 2>/dev/null || echo UNKNOWN)"
+printf 'Machine ID:   %s\n' "$(cat /etc/machine-id 2>/dev/null || echo UNKNOWN)"
+if [ -r /etc/bpi-zero-clock-release ]; then
+    awk -F= '/^(PRODUCT|VERSION|BASE_VERSION|KERNEL_ABI)=/ {printf "%-13s %s\n", $1 ":", $2}' /etc/bpi-zero-clock-release
+fi
+printf 'Kernel:       %s\n' "$(uname -r 2>/dev/null || echo UNKNOWN)"
+printf 'Uptime:       %s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo UNKNOWN)"
+
+section "FIRSTBOOT"
+if [ -r /var/lib/bpi-zero-wbuild-status ]; then
+    cat /var/lib/bpi-zero-wbuild-status
+else
+    echo "Status file:  unavailable"
+fi
+systemctl --no-pager --full status bpi-zero-wbuild-firstboot.service 2>/dev/null | sed -n '1,12p' || true
+
+section "WIFI + IPV4"
+if [ -e /sys/class/net/wlan0 ]; then
+    printf 'MAC:          %s\n' "$(cat /sys/class/net/wlan0/address 2>/dev/null || echo UNKNOWN)"
+    if command -v iw >/dev/null 2>&1; then
+        iw dev wlan0 link 2>/dev/null || true
+        iw dev wlan0 get power_save 2>/dev/null || true
+    fi
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 -br addr show wlan0 2>/dev/null || true
+        ip -4 route show default 2>/dev/null || true
+    fi
+else
+    echo "wlan0:       MISSING"
+fi
+
+section "CPU + THERMAL"
+TEMP_RAW="$(value_or /sys/class/thermal/thermal_zone0/temp UNKNOWN)"
+if printf '%s' "$TEMP_RAW" | grep -Eq '^[0-9]+$'; then
+    awk -v t="$TEMP_RAW" 'BEGIN {printf "Temperature:  %.1f C\n", t / 1000}'
+else
+    printf 'Temperature:  %s\n' "$TEMP_RAW"
+fi
+CPUFREQ=/sys/devices/system/cpu/cpu0/cpufreq
+printf 'Governor:     %s\n' "$(value_or "$CPUFREQ/scaling_governor")"
+printf 'Current kHz:  %s\n' "$(value_or "$CPUFREQ/scaling_cur_freq")"
+printf 'Minimum kHz:  %s\n' "$(value_or "$CPUFREQ/scaling_min_freq")"
+printf 'Maximum kHz:  %s\n' "$(value_or "$CPUFREQ/scaling_max_freq")"
+if [ -r "$CPUFREQ/stats/time_in_state" ]; then
+    echo "Time in state (kHz ticks):"
+    cat "$CPUFREQ/stats/time_in_state"
+fi
+printf 'Load:         %s\n' "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo UNKNOWN)"
+
+echo "Top CPU processes:"
+ps -eo pid,comm,%cpu --sort=-%cpu 2>/dev/null | head -8 || true
+
+section "RELEVANT KERNEL MESSAGES"
+dmesg 2>/dev/null | grep -Ei 'brcmfmac|brcmutil|firmware|mmc|sdio|cpufreq|thermal|opp|clock-frequency|cpu.*clock' | tail -80 || true
+
+if [ ! -e /var/lib/bpi-zero-wbuild-firstboot.done ] && [ -r /var/log/bpi-zero-wbuild-firstboot.log ]; then
+    section "FIRSTBOOT LOG TAIL"
+    tail -80 /var/log/bpi-zero-wbuild-firstboot.log
+fi

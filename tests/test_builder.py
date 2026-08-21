@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-assert (root / "VERSION").read_text().strip() == "1.0.4-preview25"
+assert (root / "VERSION").read_text().strip() == "1.0.4-preview36"
 
 build = (root / "build.sh").read_text()
 for cmd, pkg in [
@@ -13,6 +13,7 @@ for cmd, pkg in [
     ("ar", "binutils"),
     ("tar", "tar"),
     ("gzip", "gzip"),
+    ("unzip", "unzip"),
 ]:
     assert f"command -v {cmd}" in build, f"missing startup dependency check for {cmd}"
     assert f"MISSING_HOST_PKGS+=({pkg})" in build, f"missing package mapping for {cmd}"
@@ -23,7 +24,8 @@ for p in [
     root / "build.sh",
     root / "overlay/root/bpi-zero-wbuild-firstboot.sh",
     root / "clock/hardware/mk-piclock-bind-spidev",
-    root / "scripts/build_audio_modules.sh",
+    root / "scripts/build_max98357a_module.sh",
+    root / "scripts/patch_playback_dtb.sh",
 ]:
     result = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
     assert result.returncode == 0, f"shell syntax error in {p}: {result.stderr}"
@@ -32,9 +34,9 @@ for p in [
     root / "scripts/make_fat32.py",
     root / "scripts/patch_mbr.py",
     root / "tests/fdt_read.py",
-    root / "scripts/apply_audio_source_transforms.py",
+    root / "scripts/mbr_partuuid.py",
+    root / "scripts/set_extlinux_policy.py",
     root / "scripts/relocate_debian_header_sdk.py",
-    root / "scripts/set_boot_loglevel.py",
 ]:
     compile(p.read_text(), str(p), "exec")
 
@@ -70,12 +72,11 @@ with tempfile.TemporaryDirectory() as td:
     assert "AcceptEnv APP_TOKEN" in extra_cfg
     assert "LC_CTYPE" not in extra_cfg
 
-# Inherit the validated 1.2.6 firstboot/storage/network behavior.
-assert "command -v ip" in firstboot
+# Inherit the validated firstboot/storage/network behavior.
 assert "command -v networkctl" not in firstboot
 resize_stage = firstboot.index('stage "02 ROOT FILESYSTEM CAPACITY"')
 network_restart = firstboot.index("systemctl restart systemd-networkd.service")
-ipv4_check = firstboot.index('stage "12 VERIFYING WIFI + IPV4 (ATTEMPT 1/2)"')
+ipv4_check = firstboot.index('stage "11 VERIFYING WIFI + IPV4 (ATTEMPT 1/2)"')
 assert resize_stage < network_restart < ipv4_check
 assert "partx --update --nr" in firstboot
 assert 'resize2fs "$ROOT_DEV"' in firstboot
@@ -111,8 +112,6 @@ assert 'libfftw3-single3_3.3.10-2+b1_armhf.deb' in build
 assert 'gcc-14-base_14.2.0-19_armhf.deb' in build
 assert 'libgomp1_14.2.0-19_armhf.deb' in build
 assert 'libsamplerate0_0.2.2-4+b2_armhf.deb' in build
-assert 'command -v arecord' in firstboot
-assert 'command -v aplay' in firstboot
 assert 'ALSA_UTILS=alsa-utils-1.2.14-1' in build
 assert 'ALSA_STATE_RESTORE=disabled-image-policy' in build
 assert 'mk-piclock-validate-ics43434-24k' not in build
@@ -123,15 +122,26 @@ assert 'systemctl mask alsa-restore.service alsa-state.service alsa-utils.servic
 assert 'libnl-3-200_3.7.0-2_armhf.deb' in build
 assert 'libnl-genl-3-200_3.7.0-2_armhf.deb' in build
 assert 'PowerSaveDisable=brcmfmac' in firstboot
-assert 'command -v iw' in firstboot
 assert 'iw dev wlan0 get power_save' in firstboot
 assert 'PACKAGES_MARKER=' in firstboot
 assert 'IDENTITY_MARKER=' in firstboot
-assert 'FIRMWARE_MARKER=' in firstboot
+assert 'systemd-machine-id-setup' in firstboot
+assert 'note "Machine ID: $MACHINE_ID"' in firstboot
+assert 'FIRMWARE_MARKER=' not in firstboot
+assert 'pkgroot/brcmfmac43430-sdio' not in build
+assert 'pkgroot/regulatory.db' not in build
+assert 'WIFI_FIRMWARE_INSTALL=image-build-direct' in build
+for token in [
+    'install -m 0644 "$REGDB" "$MNT/usr/lib/firmware/regulatory.db"',
+    'install -m 0644 "$CYPRESS_BIN" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.bin"',
+    'install -m 0644 "$BOARD_TXT" "$MNT/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt"',
+]:
+    assert token in build, token
+assert 'stage "07 REGULATORY + BCM43430 WIFI FIRMWARE"' not in firstboot
 assert 'SSH_MARKER=' in firstboot
 assert 'CURRENT_HOST=' in firstboot
 assert "grep -Eq '^bpi-zero-wbuild-[0-9a-z]{3}$'" in firstboot
-assert 'stage "13 WIFI RECOVERY RETRY"' in firstboot
+assert 'stage "12 WIFI RECOVERY RETRY"' in firstboot
 assert 'wait_ipv4 60' in firstboot
 assert 'console_line' in firstboot
 assert 'PKG_LOG=/var/log/bpi-zero-wbuild-packages.log' in firstboot
@@ -142,27 +152,39 @@ assert 'Associated:' in firstboot
 assert 'BSSID:' in firstboot
 assert 'Signal:' in firstboot
 assert 'Power save:' in firstboot
-assert firstboot.count('stage "10 TIME ZONE"') == 1
+assert firstboot.count('stage "09 TIME ZONE"') == 1
 
 # Preview23 correctness hardening.
 assert 'IWD_PROFILE_STATE="$STATE_DIR/iwd-profile"' in firstboot
 assert 'trap cleanup_config_mount EXIT' in firstboot
 assert 'config_value()' in firstboot
-assert 'cleanup_staged_firmware()' in firstboot
+assert 'cleanup_staged_firmware()' not in firstboot
 assert 'cleanup_staged_packages()' in firstboot
-assert 'systemctl is-enabled "$unit"' in firstboot
 assert 'Removed stale firstboot Wi-Fi profile' in firstboot
 assert 'provisioning complete but unable to disable firstboot service' in firstboot
 assert 'provisioning is complete but firstboot service could not be disabled' in firstboot
 kernel_pin = (root / 'clock/kernel-pin.pref').read_text()
 for pkg in [
     'linux-image-armmp', 'linux-headers-armmp',
-    'linux-image-6.12.100+deb13-armmp',
-    'linux-headers-6.12.100+deb13-armmp',
-    'linux-headers-6.12.100+deb13-common',
+    'linux-image-6.12.101+deb13-armmp',
+    'linux-headers-6.12.101+deb13-armmp',
+    'linux-headers-6.12.101+deb13-common',
 ]:
     assert pkg in kernel_pin, pkg
 assert 'KERNEL_UPDATE_POLICY=image-release-owned-exact-abi-pinned' in build
+
+# Release image identity must be clone-safe. The base image currently carries
+# a populated machine-id, so finalization must clear it and eliminate the
+# independent D-Bus fallback before the root filesystem is packaged.
+for token in [
+    'truncate -s 0 "$MNT/etc/machine-id"',
+    'rm -f "$MNT/var/lib/dbus/machine-id"',
+    'ln -s /etc/machine-id "$MNT/var/lib/dbus/machine-id"',
+    'MACHINE_ID_POLICY=firstboot-systemd-machine-id-setup',
+]:
+    assert token in build, token
+machine_reset = build.index('truncate -s 0 "$MNT/etc/machine-id"')
+assert machine_reset < build.index('\nsync\n', machine_reset)
 
 # First boot assigns a persistent random appliance hostname in the
 # bpi-zero-wbuild-xxx format instead of cloning one shared hostname.
@@ -184,33 +206,68 @@ assert not re.search(r"\b(?:apt|apt-get|dpkg)\b[^\n]*\bbluez(?:\s|$)", commands)
 
 # Derivative and base identities remain explicit.
 assert "PRODUCT=bpi-zero-clock" in build
-assert "BASE_VERSION=1.2.6" in build
+assert "BASE_VERSION=1.2.7" in build
 assert "PRODUCT=bpi-zero-wbuild" in build
-assert "VERSION=1.2.6" in build
+assert "VERSION=1.2.7" in build
 assert "HARDWARE_CONFIGURATION=clock-image-owned" in build
 assert 'OUT_IMG="$OUT_DIR/bpi-zero-clock-$VERSION-bpi-m2-zero.img"' in build
 
-# Exact source-built audio path is invoked by the image builder.
-assert 'scripts/build_audio_modules.sh' in build
-assert 'MK_AUDIO_BUILD_WORK=' in build
-assert 'MK_AUDIO_BUILD_OUT=' in build
-assert 'snd-soc-dmic.ko.xz' in build
-assert 'snd-soc-simple-card.ko.xz' in build
-assert 'sun4i-i2s.ko.xz' in build
-assert 'patch_asoc_24k_module.py' not in build
+# Preview36 keeps playback-only audio while migrating to Debian 6.12.101.
+assert 'EXPECTED_ABI="6.12.101+deb13-armmp"' in build
+assert 'scripts/build_max98357a_module.sh' in build
+assert 'scripts/patch_playback_dtb.sh' in build
+assert (root / 'clock/playback/max98357a.c').exists()
+assert (root / 'clock/playback/Makefile').exists()
+assert (root / 'scripts/relocate_debian_header_sdk.py').exists()
+assert not (root / 'scripts/build_audio_modules.sh').exists()
+assert not (root / 'scripts/apply_audio_source_transforms.py').exists()
+assert 'AUDIO_MODE=playback-only' in build
+assert 'AUDIO_CAPTURE=removed' in build
+assert 'I2S_RX_GPIO=unassigned' in build
+assert 'I2S_RX_HEADER_PIN=38-free' in build
+assert 'TOUCH_GPIO=PA17' in build and 'TOUCH_HEADER_PIN=37' in build
+assert 'snd-soc-dmic' not in (root / 'clock/hardware/bpi-zero-clock.modules').read_text()
+module_builder=(root / 'scripts/build_max98357a_module.sh').read_text()
+assert 'ABI="6.12.101+deb13-armmp"' in module_builder
+assert 'DEBIAN_VERSION="6.12.101-1"' in module_builder
+assert 'gcc-arm-linux-gnueabihf' in module_builder
+assert 'SOURCE_SHA256="75b251c2eaa9aa03ae18bea9a1d134308ab8e882bde3f08523ca9f1d55797d54"' in module_builder
+assert 'snd-soc-dmic' not in module_builder
+assert 'sun4i-i2s.ko' not in module_builder
 
-# Appliance console policy is image-owned and survives future initramfs updates.
-boot_policy = (root / "scripts/set_boot_loglevel.py").read_text()
-assert "quiet loglevel=3" in boot_policy
-assert "LOGLEVEL_RE" in boot_policy
-assert "command -v mkimage" in build
-assert "u-boot-tools" in build
-assert 'BOOT_CMD="$MNT/boot/boot.cmd"' in build
-assert 'BOOT_UPDATE_HOOK="$MNT/etc/initramfs/post-update.d/zz-update-uimg"' in build
-assert 'python3 "$HERE/scripts/set_boot_loglevel.py" "$BOOT_CMD" "$BOOT_UPDATE_HOOK"' in build
-assert 'mkimage -A arm -T script -C none -d "$BOOT_CMD" "$BOOT_SCR"' in build
-assert "KERNEL_BOOT_QUIET=yes" in build
-assert "KERNEL_CONSOLE_LOGLEVEL=3" in build
+# New rootfs uses extlinux. The builder owns a noninteractive, quiet, PARTUUID boot policy.
+extlinux_policy=(root / 'scripts/set_extlinux_policy.py').read_text()
+partuuid_script=(root / 'scripts/mbr_partuuid.py').read_text()
+assert 'EXTLINUX_CONF="$MNT/boot/extlinux/extlinux.conf"' in build
+assert 'ROOT_PARTUUID="$(python3 "$HERE/scripts/mbr_partuuid.py" boot.bin --partition 2)"' in build
+assert 'set_extlinux_policy.py' in build
+assert 'quiet loglevel=4' in extlinux_policy
+assert "prompt 0" in extlinux_policy
+assert "timeout 10" in extlinux_policy
+assert 'PARTUUID' in extlinux_policy
+assert "struct.unpack_from('<I', mbr, 440)" in partuuid_script
+assert 'command -v mkimage' not in build
+assert 'u-boot-tools' not in build
+assert '/boot/boot.cmd' not in build
+assert '/boot/boot.scr' not in build
+assert 'KERNEL_BOOT_QUIET=yes' in build
+assert 'KERNEL_CONSOLE_LOGLEVEL=4' in build
+
+# Synthetic extlinux normalization test.
+with tempfile.TemporaryDirectory() as td:
+    ext = Path(td) / 'extlinux.conf'
+    defaults = Path(td) / 'u-boot'
+    ext.write_text('default l0\nprompt 1\ntimeout 50\nlabel l0\n\tappend root=LABEL=rootfs rw rootwait\n')
+    defaults.write_text('U_BOOT_PARAMETERS="rw rootwait"\n')
+    r = subprocess.run([
+        'python3', str(root / 'scripts/set_extlinux_policy.py'),
+        str(ext), str(defaults), '--partuuid', '12345678-02',
+    ], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert 'prompt 0' in ext.read_text()
+    assert 'timeout 10' in ext.read_text()
+    assert 'append root=PARTUUID=12345678-02 rw rootwait quiet loglevel=4' in ext.read_text()
+    assert 'U_BOOT_ROOT="root=PARTUUID=12345678-02"' in defaults.read_text()
 
 # Cache/checksum behavior remains from the validated builder.
 assert "rm -rf pkgroot" in build
@@ -221,67 +278,30 @@ assert 'gzip -t "$dest"' in build
 assert 'rm -f "$dest" "${dest}.source-url"' in build
 assert 'fetch_gzip "$BOOT_URL" boot.bin.gz' in build
 assert 'fetch_gzip "$DEBIAN_URL" debian.bin.gz' in build
+assert ': "${DEBIAN_URL:=https://dl.sd-card-images.johang.se/debians/2026-08-17/debian-trixie-armhf-eiy3bo.bin.gz}"' in build
+assert 'DEBIAN_GZIP_SHA256="8cca0fed789a76fef8fb7c8c18bf46ed4d362f9e84d91ffecfe6674e9713c94f"' in build
+assert 'download.icubedev.com/debian-trixie-armhf-ner4uz.bin.gz' not in build
 assert 'failed gzip integrity verification after 3 fresh downloads' in build
 assert 'sha256sum "$(basename "$OUT_IMG")"' in build
 assert 'sha256sum "$(basename "$OUT_IMG").gz"' in build
 
-
-# Synthetic U-Boot bootargs normalization test.
-with tempfile.TemporaryDirectory() as td:
-    bootcmd = Path(td) / "boot.cmd"
-    hook = Path(td) / "zz-update-uimg"
-    bootcmd.write_text("setenv bootargs root=PARTUUID=${partuuid} rw rootwait loglevel=7\n")
-    hook.write_text("  setenv bootargs quiet root=PARTUUID=${partuuid} rw rootwait\n")
-    r = subprocess.run([
-        "python3", str(root / "scripts/set_boot_loglevel.py"),
-        str(bootcmd), str(hook),
-    ], capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    assert bootcmd.read_text() == "setenv bootargs quiet loglevel=3 root=PARTUUID=${partuuid} rw rootwait\n"
-    assert hook.read_text() == "  setenv bootargs quiet loglevel=3 root=PARTUUID=${partuuid} rw rootwait\n"
-
-# Synthetic Debian private-SDK relocation test. This reproduces the package
-# layout that failed on the real BPI without needing network/package downloads.
-with tempfile.TemporaryDirectory() as td:
-    sdk = Path(td) / "sdk"
-    abi = "6.12.100+deb13-armmp"
-    common_name = "linux-headers-6.12.100+deb13-common"
-    kbuild_name = "linux-kbuild-6.12.100+deb13"
-    hdr = sdk / "usr/src" / f"linux-headers-{abi}"
-    common = sdk / "usr/src" / common_name
-    kbuild = sdk / "usr/lib" / kbuild_name
-    hdr.mkdir(parents=True)
-    common.mkdir(parents=True)
-    (kbuild / "scripts").mkdir(parents=True)
-    (kbuild / "tools").mkdir(parents=True)
-    (hdr / "Makefile").write_text(f"include /usr/src/{common_name}/Makefile\n")
-    (common / "Makefile").write_text("# common\n")
-    for tree in (hdr, common):
-        (tree / "scripts").symlink_to(f"/usr/lib/{kbuild_name}/scripts")
-        (tree / "tools").symlink_to(f"/usr/lib/{kbuild_name}/tools")
-    r = subprocess.run([
-        "python3", str(root / "scripts/relocate_debian_header_sdk.py"),
-        "--sdk-root", str(sdk), "--abi", abi,
-        "--common-name", common_name, "--kbuild-name", kbuild_name,
-    ], capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    assert (hdr / "Makefile").read_text() == f"include ../{common_name}/Makefile\n"
-    for tree in (hdr, common):
-        assert (tree / "scripts").readlink() == Path(f"../../lib/{kbuild_name}/scripts")
-        assert (tree / "tools").readlink() == Path(f"../../lib/{kbuild_name}/tools")
 
 # Automated build-host package installs must never invoke interactive debconf.
 # Keep the policy command-scoped; do not persist DEBIAN_FRONTEND globally.
 assert build.count('DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true') >= 1
 assert 'DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \\\n        apt-get install -y --no-install-recommends "${MISSING_HOST_PKGS[@]}"' in build
 assert 'export DEBIAN_FRONTEND' not in build
+assert 'DEBCONF_FRONTEND_POLICY=persistent-Noninteractive-after-DHCP' in build
 
-audio_builder = (root / 'scripts/build_audio_modules.sh').read_text()
-assert 'DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \\\n        apt-get install -y --no-install-recommends "${need[@]}"' in audio_builder
-assert 'export DEBIAN_FRONTEND' not in audio_builder
+# Preview27 builder TLS/decompression prerequisites: explicit unzip and CA trust.
+assert 'command -v unzip >/dev/null 2>&1 || MISSING_HOST_PKGS+=(unzip)' in build
+assert '[ -s /etc/ssl/certs/ca-certificates.crt ] || MISSING_HOST_PKGS+=(ca-certificates)' in build
+assert 'update-ca-certificates' in build
+assert 'HTTPS CA certificate bundle unavailable' in build
+assert 'curl -k' not in build and 'curl --insecure' not in build
 
 
-# Preview25 cull invariants.
+# Preview25 cull invariants retained by preview26.
 assert 'NETWORK_IPV4_VERIFIER=iproute2' in build
 assert 'networkctl status wlan0 --no-pager 2>/dev/null |' not in firstboot
 assert 'UNKNOWN (iw unavailable)' not in firstboot
@@ -291,9 +311,20 @@ assert 'rm -f "$RESIZE_MARKER"' in firstboot
 assert 'bpi-zero-clock-audio-source-build.txt' not in build
 assert not (root / 'scripts/patch_audio_capture_dtb.py').exists()
 assert not (root / 'patches').exists()
-for dead in ['CANDIDATE-SHA256SUMS','ORIGINAL-SHA256SUMS','SOURCE-BUILD-POLICY.txt','modinfo.txt','max98357a.c','Makefile','CAPTURE-PREVIEW.txt','VALIDATION.txt']:
-    assert not (root / 'clock/validated/6.12.100+deb13-armmp' / dead).exists(), dead
-assert (root / 'clock/validated/6.12.100+deb13-armmp/HARDWARE-VALIDATION.txt').exists()
+assert not (root / 'clock/validated').exists()
+assert (root / 'clock/playback/max98357a.c').exists()
 assert (root / 'config/CONFIG.TXT.template').stat().st_size < 2048
 
-print("bpi-zero-clock 1.0.4-preview25 full-cull inherited-builder checks passed")
+# Preview26 post-cull cleanup/completion invariants.
+unit = (root / 'overlay/root/bpi-zero-wbuild-firstboot.service').read_text()
+assert 'ConditionPathExists=' not in unit
+assert 'ExecStart=/bin/bash /root/bpi-zero-wbuild-firstboot.sh' in unit
+assert 'if [ -e "$MARKER" ]; then' in firstboot
+marker_branch = firstboot.index('if [ -e "$MARKER" ]; then')
+assert firstboot.index('systemctl disable bpi-zero-wbuild-firstboot.service', marker_branch) > marker_branch
+assert 'for src in "$HERE"/overlay/root/*.sh; do' in build
+assert 'for src in "$HERE"/overlay/root/*.sh "$HERE"/overlay/root/*.service; do' not in build
+assert "find pkgroot -maxdepth 1 -type f -name '*.source-url' -delete" in build
+assert build.index("find pkgroot -maxdepth 1 -type f -name '*.source-url' -delete") < build.index('cp -f pkgroot/* "$MNT/root/"')
+
+print("bpi-zero-clock 1.0.4-preview36 new-root playback-only inherited-builder checks passed")

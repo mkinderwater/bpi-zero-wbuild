@@ -1,6 +1,5 @@
-# bpi-zero-clock owns the validated kernel ABI and matching headers.
-# Prevent both meta-package advancement and replacement of the exact ABI
-# packages that the local ASoC modules/DTB were validated against.
-Package: linux-image-armmp linux-headers-armmp linux-image-6.12.100+deb13-armmp linux-headers-6.12.100+deb13-armmp linux-headers-6.12.100+deb13-common
+# bpi-zero-clock owns the exact Debian kernel ABI used by this appliance.
+# Prevent meta-package advancement or replacement outside a tested image release.
+Package: linux-image-armmp linux-headers-armmp linux-image-6.12.101+deb13-armmp linux-headers-6.12.101+deb13-armmp linux-headers-6.12.101+deb13-common
 Pin: version *
 Pin-Priority: -1

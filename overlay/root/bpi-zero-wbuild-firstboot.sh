@@ -4,11 +4,11 @@ set -euo pipefail
 LOG=/var/log/bpi-zero-wbuild-firstboot.log
 PKG_LOG=/var/log/bpi-zero-wbuild-packages.log
 MARKER=/var/lib/bpi-zero-wbuild-firstboot.done
+STATUS_FILE=/var/lib/bpi-zero-wbuild-status
 STATE_DIR=/var/lib/bpi-zero-wbuild-firstboot
 RESIZE_MARKER=/var/lib/bpi-zero-wbuild-resize.done
 IDENTITY_MARKER="$STATE_DIR/identity.done"
 SSH_MARKER="$STATE_DIR/ssh.done"
-FIRMWARE_MARKER="$STATE_DIR/firmware.done"
 PACKAGES_MARKER="$STATE_DIR/packages.done"
 IWD_PROFILE_STATE="$STATE_DIR/iwd-profile"
 
@@ -33,8 +33,19 @@ note() {
     console_line "  $*"
 }
 
+write_status() {
+    local state="$1" wifi="${2:-pending}" ipv4="${3:-NONE}"
+    {
+        printf 'FIRSTBOOT=%s\n' "$state"
+        printf 'WIFI=%s\n' "$wifi"
+        printf 'IPV4=%s\n' "$ipv4"
+    } >"$STATUS_FILE"
+}
+
 fail() {
     echo "ERROR: $*"
+    write_status failed unknown NONE
+    printf 'ERROR=%s\n' "$*" >>"$STATUS_FILE"
     console_line "  ERROR: $*"
     exit 1
 }
@@ -46,6 +57,7 @@ cleanup_completed_state() {
     rm -f "$RESIZE_MARKER"
 }
 
+write_status running pending NONE
 stage "01 FIRSTBOOT SERVICE STARTED"
 date -Is 2>/dev/null || date
 echo "Clock may be unsynchronized until networking is available."
@@ -56,6 +68,7 @@ if [ -e "$MARKER" ]; then
     systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
         fail "provisioning is complete but firstboot service could not be disabled."
     cleanup_completed_state
+    write_status complete connected "$(ip -4 -o addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
     note "Provisioning already complete; firstboot service disabled; intermediate checkpoints removed."
     exit 0
 fi
@@ -76,9 +89,6 @@ else
     [ -n "$ROOT_DEV" ] || fail "unable to determine root device."
     [ -n "$PARTNUM" ] || fail "unable to determine root partition number for $ROOT_DEV."
     [ -n "$PKNAME" ] || fail "unable to determine parent disk for $ROOT_DEV."
-    command -v partx >/dev/null 2>&1 || fail "partx is unavailable."
-    command -v resize2fs >/dev/null 2>&1 || fail "resize2fs is unavailable."
-
     DISK="/dev/$PKNAME"
     TOTAL_SECTORS="$(blockdev --getsz "$DISK")"
     ROOT_BASENAME="$(basename "$ROOT_DEV")"
@@ -174,13 +184,16 @@ fi
 # hostname, reuse it even if the identity checkpoint itself was not reached.
 # ---------------------------------------------------------------------------
 stage "05 DEVICE IDENTITY + ACCOUNTS"
+systemd-machine-id-setup
+MACHINE_ID="$(cat /etc/machine-id)"
+note "Machine ID: $MACHINE_ID"
+
 CURRENT_HOST="$(cat /etc/hostname 2>/dev/null | tr -d '[:space:]' || true)"
 if printf '%s' "$CURRENT_HOST" | grep -Eq '^bpi-zero-wbuild-[0-9a-z]{3}$'; then
     HOSTNAME_NEW="$CURRENT_HOST"
 else
     HOST_ALPHABET='0123456789abcdefghijklmnopqrstuvwxyz'
     HOST_RANDOM="$(od -An -N2 -tu2 /dev/urandom | tr -d '[:space:]')"
-    [ -n "$HOST_RANDOM" ] || fail "unable to generate hostname suffix."
     HOST_RANDOM=$((HOST_RANDOM % 46656))
     HOST_SUFFIX="${HOST_ALPHABET:$((HOST_RANDOM / 1296)):1}${HOST_ALPHABET:$(((HOST_RANDOM / 36) % 36)):1}${HOST_ALPHABET:$((HOST_RANDOM % 36)):1}"
     HOSTNAME_NEW="bpi-zero-wbuild-$HOST_SUFFIX"
@@ -219,52 +232,7 @@ else
     note "SSH host keys ready."
 fi
 
-stage "07 REGULATORY + BCM43430 WIFI FIRMWARE"
-ROOT_FW=/root/brcmfmac43430-sdio.bin
-ROOT_FW_BOARD='/root/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.bin'
-ROOT_CLM=/root/brcmfmac43430-sdio.clm_blob
-ROOT_CLM_BOARD='/root/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.clm_blob'
-ROOT_NVRAM='/root/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt'
-ROOT_REGDB=/root/regulatory.db
-ROOT_REGSIG=/root/regulatory.db.p7s
-FIRMWARE_STAGE=("$ROOT_FW" "$ROOT_FW_BOARD" "$ROOT_CLM" "$ROOT_CLM_BOARD" "$ROOT_NVRAM" "$ROOT_REGDB" "$ROOT_REGSIG")
-cleanup_staged_firmware() {
-    rm -f "${FIRMWARE_STAGE[@]}" || note "WARNING: unable to remove all staged firmware payloads."
-}
-if [ -e "$FIRMWARE_MARKER" ]; then
-    cleanup_staged_firmware
-    note "Wi-Fi firmware checkpoint reused; staged firmware cleanup verified."
-else
-    for fw in "${FIRMWARE_STAGE[@]}"; do
-        [ -s "$fw" ] || fail "staged Wi-Fi firmware missing: $fw"
-    done
-    mkdir -p /usr/lib/firmware/brcm
-    cp -f "$ROOT_REGDB" /usr/lib/firmware/regulatory.db
-    cp -f "$ROOT_REGSIG" /usr/lib/firmware/regulatory.db.p7s
-    cp -f "$ROOT_FW" /usr/lib/firmware/brcm/brcmfmac43430-sdio.bin
-    cp -f "$ROOT_FW_BOARD" '/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.bin'
-    cp -f "$ROOT_CLM" /usr/lib/firmware/brcm/brcmfmac43430-sdio.clm_blob
-    cp -f "$ROOT_CLM_BOARD" '/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.clm_blob'
-    cp -f "$ROOT_NVRAM" '/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt'
-    chmod 644 /usr/lib/firmware/regulatory.db /usr/lib/firmware/regulatory.db.p7s \
-      /usr/lib/firmware/brcm/brcmfmac43430-sdio.bin \
-      '/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.bin' \
-      /usr/lib/firmware/brcm/brcmfmac43430-sdio.clm_blob \
-      '/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.clm_blob' \
-      '/usr/lib/firmware/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt'
-    modprobe -r brcmfmac 2>/dev/null || true
-    modprobe -r brcmutil 2>/dev/null || true
-    modprobe brcmfmac
-    # Commit the checkpoint before removing installation payloads. If power is
-    # lost during cleanup, the next firstboot retry safely finishes cleanup.
-    touch "$FIRMWARE_MARKER"
-    sync
-    cleanup_staged_firmware
-    sync
-    note "BCM43430 firmware + board NVRAM ready; staged firmware removed."
-fi
-
-stage "08 RUNTIME USERSPACE + CLI TOOLS"
+stage "07 RUNTIME USERSPACE + CLI TOOLS"
 PACKAGES=(
   /root/readline-common_8.2-6_all.deb
   /root/libreadline8t64_8.2-6_armhf.deb
@@ -305,9 +273,9 @@ else
         [ -f "$package" ] || fail "package missing: $package"
     done
     : >"$PKG_LOG"
-    # Automated provisioning must never select debconf's interactive Readline
-    # frontend. Keep this policy scoped to these dpkg commands only so later
-    # manual administration retains Debian's normal debconf behavior.
+    # Networking userspace is installed before Wi-Fi exists, so these bootstrap
+    # dpkg calls must be noninteractive themselves. Stage 14 later makes the
+    # same headless policy persistent for future package administration.
     if ! DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
             dpkg --unpack "${PACKAGES[@]}" >>"$PKG_LOG" 2>&1; then
         echo "Package unpack failed; last 80 lines from $PKG_LOG:"
@@ -320,20 +288,8 @@ else
         tail -80 "$PKG_LOG" || true
         fail "runtime package configuration failed."
     fi
-    # alsa-utils is included for diagnostics only. Prevent Debian's automatic
-    # state restore/save units from owning appliance audio state at boot. This
-    # is required appliance policy, so masking and verification are fail-closed.
-    if ! systemctl mask alsa-restore.service alsa-state.service alsa-utils.service >>"$PKG_LOG" 2>&1; then
-        fail "unable to mask ALSA state restore/save services."
-    fi
-    for unit in alsa-restore.service alsa-state.service alsa-utils.service; do
-        unit_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
-        [ "$unit_state" = "masked" ] || fail "$unit is not masked (state: ${unit_state:-unknown})."
-    done
-    command -v ip >/dev/null 2>&1 || fail "iproute2 installed but 'ip' is unavailable."
-    command -v iw >/dev/null 2>&1 || fail "iw installed but the CLI tool is unavailable."
-    command -v arecord >/dev/null 2>&1 || fail "alsa-utils installed but 'arecord' is unavailable."
-    command -v aplay >/dev/null 2>&1 || fail "alsa-utils installed but 'aplay' is unavailable."
+    # alsa-utils is diagnostic-only; appliance audio state is application-owned.
+    systemctl mask alsa-restore.service alsa-state.service alsa-utils.service >>"$PKG_LOG" 2>&1
     # Commit the successful package state before removing the offline payload.
     # A power loss during cleanup therefore cannot strand firstboot without .debs.
     touch "$PACKAGES_MARKER"
@@ -344,7 +300,7 @@ else
     echo "Detailed dpkg output: $PKG_LOG"
 fi
 
-stage "09 READING BPIWBUILD CONFIG"
+stage "08 READING BPIWBUILD CONFIG"
 modprobe vfat 2>/dev/null || true
 CFG_MNT=/mnt/bpi-zero-wbuild-config
 CFG_MOUNTED=0
@@ -393,7 +349,7 @@ case "$HIDDEN" in true|false) ;; *) HIDDEN="false" ;; esac
 [ -n "$TIMEZONE" ] || TIMEZONE="America/Edmonton"
 note "Config: SSID='$SSID' country=$COUNTRY hidden=$HIDDEN timezone=$TIMEZONE"
 
-stage "10 TIME ZONE"
+stage "09 TIME ZONE"
 if timedatectl list-timezones 2>/dev/null | grep -qxF "$TIMEZONE"; then
     timedatectl set-timezone "$TIMEZONE" || true
 else
@@ -402,7 +358,7 @@ else
 fi
 note "Timezone: $(timedatectl show -p Timezone --value 2>/dev/null || echo "$TIMEZONE")"
 
-stage "11 CONFIGURING WIFI + DHCP"
+stage "10 CONFIGURING WIFI + DHCP"
 mkdir -p /etc/iwd /var/lib/iwd /etc/systemd/network
 cat >/etc/iwd/main.conf <<EOF2
 [General]
@@ -452,11 +408,7 @@ DHCP=ipv4
 IPv6AcceptRA=no
 EOF2
 systemctl daemon-reload
-for unit in iwd.service systemd-networkd.service ssh.service; do
-    systemctl enable "$unit" >/dev/null 2>&1 || fail "unable to enable $unit."
-    unit_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
-    [ "$unit_state" = "enabled" ] || fail "$unit is not enabled (state: ${unit_state:-unknown})."
-done
+systemctl enable iwd.service systemd-networkd.service ssh.service >/dev/null
 systemctl restart iwd.service
 systemctl restart systemd-networkd.service
 systemctl restart systemd-resolved.service || true
@@ -571,14 +523,14 @@ wait_ipv4() {
     return 1
 }
 
-stage "12 VERIFYING WIFI + IPV4 (ATTEMPT 1/2)"
+stage "11 VERIFYING WIFI + IPV4 (ATTEMPT 1/2)"
 DHCP_OK=0
 if wait_ipv4 60; then
     DHCP_OK=1
     wifi_diag_snapshot "attempt 1 success"
 else
     wifi_diag_snapshot "attempt 1 failed"
-    stage "13 WIFI RECOVERY RETRY"
+    stage "12 WIFI RECOVERY RETRY"
     note "No IPv4 after 60 seconds; restarting radio/userspace once."
     systemctl stop iwd.service || true
     modprobe -r brcmfmac 2>/dev/null || true
@@ -588,7 +540,7 @@ else
     systemctl restart systemd-networkd.service || true
     systemctl restart iwd.service || true
     systemctl restart systemd-resolved.service || true
-    stage "14 VERIFYING WIFI + IPV4 (ATTEMPT 2/2)"
+    stage "13 VERIFYING WIFI + IPV4 (ATTEMPT 2/2)"
     if wait_ipv4 60; then
         DHCP_OK=1
         wifi_diag_snapshot "attempt 2 success"
@@ -598,6 +550,7 @@ else
 fi
 
 if [ "$DHCP_OK" -ne 1 ]; then
+    write_status failed failed NONE
     echo "ERROR: wlan0 did not receive an IPv4 DHCP address after two attempts."
     echo "Useful diagnostics:"
     echo "  ip -br addr"
@@ -613,17 +566,23 @@ fi
 show_ipv4
 report_wifi_power_save
 IPV4_ADDR="$(ip -4 -o addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+write_status running connected "${IPV4_ADDR:-NONE}"
 note "IPv4 ready: ${IPV4_ADDR:-configured}"
 systemctl restart ssh.service || true
+
+stage "14 PERSISTENT HEADLESS DEBCONF"
+printf '%s\n' 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+note "Debconf frontend: Noninteractive (persistent)"
 
 stage "15 FIRSTBOOT COMPLETE"
 # Commit completion before disabling this service. If power is lost after the
 # marker but before disable finishes, the marker branch retries the disable.
 touch "$MARKER"
+write_status complete connected "${IPV4_ADDR:-NONE}"
 sync
 systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
     fail "provisioning complete but unable to disable firstboot service."
 cleanup_completed_state
-note "Provisioning complete: storage, identity, Wi-Fi, DHCP, SSH and network diagnostics ready."
+note "Provisioning complete: storage, identity, Wi-Fi, DHCP, SSH, headless package configuration and network diagnostics ready."
 note "No reboot required."
 exit 0

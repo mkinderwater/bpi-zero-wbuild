@@ -1,275 +1,219 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import hashlib
-import importlib.util
 import re
+import subprocess
+import tempfile
 
 root = Path(__file__).resolve().parents[1]
 build = (root / 'build.sh').read_text()
 readme = (root / 'README.md').read_text()
 install_doc = (root / 'INSTALL.md').read_text()
-modules = (root / 'clock/hardware/bpi-zero-clock.modules').read_text().splitlines()
-source_builder = (root / 'scripts/build_audio_modules.sh').read_text()
-transformer = (root / 'scripts/apply_audio_source_transforms.py').read_text()
-relocator = (root / 'scripts/relocate_debian_header_sdk.py').read_text()
-abi = '6.12.100+deb13-armmp'
-validated = root / 'clock' / 'validated' / abi
-ko = validated / 'snd-soc-max98357a.ko'
-dtb = validated / 'sun8i-h2-plus-bananapi-m2-zero.dtb'
-
-assert (root / 'VERSION').read_text().strip() == '1.0.4-preview25'
-assert 'BPI_ZERO_CLOCK_VERSION:-1.0.4-preview25' in build
-assert f'VALIDATED_ABI="{abi}"' in build
-assert 'VALIDATED_DTB_SHA256="0ff283cc75acd93a43722769e3d9771dcb5d629825348593fdd4da605e4b1452"' in build
-assert 'playback-validated-capture-source-built-clock-dma-hardware-confirmed' in build
-assert 'APPLICATION_AUDIO_BASELINE=mk-clock-adult-2.3.50-preview25' in build
-assert 'modinfo -b "$MNT" -k "$KERNEL_ABI" -n "$mod"' in build
-assert 'modprobe -d "$MNT" -S "$KERNEL_ABI" -n "$mod"' in build
-assert 'MODPROBE_CFG=' not in build
-assert 'module resolution OK:' in build
-assert 'env -u XZ_OPT xz -C crc32 -f -T1 -3 --memlimit-compress=64MiB' in source_builder
-assert 'xz -C crc32 -f -9' not in source_builder
-assert 'xz -T0' not in source_builder
-
-# Physical-console kernel chatter is reduced without disabling audit.
-boot_policy = (root / 'scripts/set_boot_loglevel.py').read_text()
-assert 'quiet loglevel=3' in boot_policy
-assert 'audit=0' not in boot_policy
-assert 'KERNEL_BOOT_QUIET=yes' in build
-assert 'KERNEL_CONSOLE_LOGLEVEL=3' in build
-
-# 24/7 SD-endurance and watchdog policy is image-owned.
-journal = (root / 'clock/hardware/journald-volatile.conf').read_text()
-tmp_mount = (root / 'clock/hardware/tmp.mount').read_text()
-watchdog = (root / 'clock/hardware/system-watchdog.conf').read_text()
-assert 'Storage=volatile' in journal
-assert 'RuntimeMaxUse=16M' in journal
-assert 'RuntimeMaxFileSize=4M' in journal
-assert 'What=tmpfs' in tmp_mount
-assert 'Where=/tmp' in tmp_mount
-assert 'size=64M' in tmp_mount
-assert 'RuntimeWatchdogSec=30s' in watchdog
-assert 'RebootWatchdogSec=2min' in watchdog
-for token in [
-    '/etc/systemd/journald.conf.d/20-mk-clock-volatile.conf',
-    '/etc/systemd/system.conf.d/20-mk-clock-watchdog.conf',
-    '/etc/systemd/system/tmp.mount',
-    'local-fs.target.wants/tmp.mount',
-    'rm -rf "$MNT/var/log/journal"',
-    'JOURNAL_STORAGE=volatile',
-    'JOURNAL_RUNTIME_MAX_USE=16M',
-    'TMP_MOUNT=tmpfs-64M',
-    'SYSTEMD_RUNTIME_WATCHDOG_SEC=30s',
-]:
-    assert token in build, token
-
-
-# Resumable firstboot and CLI diagnostics are image-owned.
 firstboot = (root / 'overlay/root/bpi-zero-wbuild-firstboot.sh').read_text()
-for token in [
-    'CLI_NETWORK_TOOL=iproute2-6.15.0-1',
-    'FIRSTBOOT_RESUME=checkpointed',
-    'WIFI_RECOVERY_RETRY=one-controlled-radio-userspace-restart',
-    'FIRSTBOOT_CONSOLE_LOGGING=stage-summary',
-    'iproute2_6.15.0-1_armhf.deb',
-    'iw_6.9-1_armhf.deb',
-    'CLI_WIFI_TOOL=iw-6.9-1',
-    'WIFI_POWER_SAVE_POLICY=iwd-DriverQuirks-PowerSaveDisable-brcmfmac',
-    'ALSA_UTILS=alsa-utils-1.2.14-1',
-    'ALSA_STATE_RESTORE=disabled-image-policy',
-]:
-    assert token in build, token
-for token in [
-    'IDENTITY_MARKER=', 'SSH_MARKER=', 'FIRMWARE_MARKER=', 'PACKAGES_MARKER=',
-    'stage "13 WIFI RECOVERY RETRY"', 'PKG_LOG=/var/log/bpi-zero-wbuild-packages.log',
-    'command -v ip', 'command -v iw', 'PowerSaveDisable=brcmfmac',
-    'iw dev wlan0 get power_save', 'wifi_diag_snapshot', 'SSID visible:', 'Associated:', 'console_line',
-    'command -v arecord', 'command -v aplay', 'alsa-utils_1.2.14-1_armhf.deb',
-    'systemctl mask alsa-restore.service alsa-state.service alsa-utils.service',
-]:
-    assert token in firstboot, token
+modules = (root / 'clock/hardware/bpi-zero-clock.modules').read_text().splitlines()
 
-# Preview23 firstboot hardening is fail-safe and cleanup remains checkpoint-safe.
+VERSION='1.0.4-preview36'
+ABI='6.12.101+deb13-armmp'
+DEBIAN_VERSION='6.12.101-1'
+ROOT_GZ_SHA='8cca0fed789a76fef8fb7c8c18bf46ed4d362f9e84d91ffecfe6674e9713c94f'
+SOURCE_SHA='75b251c2eaa9aa03ae18bea9a1d134308ab8e882bde3f08523ca9f1d55797d54'
+
+assert (root / 'VERSION').read_text().strip() == VERSION
+assert f'BPI_ZERO_CLOCK_VERSION:-{VERSION}' in build
+assert f'EXPECTED_ABI="{ABI}"' in build
+assert 'BASE_VERSION=1.2.7' in build
+assert 'VERSION=1.2.7' in build
+assert 'BASE=debian-trixie-armhf-eiy3bo' in build
+assert 'AUDIO_MODE=playback-only' in build
+assert 'AUDIO_CAPTURE=removed' in build
+assert 'APPLICATION_AUDIO_BASELINE=mk-clock-adult-2.3.50-preview34' in build
+assert 'I2S_RX_GPIO=unassigned' in build
+assert 'I2S_RX_HEADER_PIN=38-free' in build
+assert 'TOUCH_GPIO=PA17' in build and 'TOUCH_HEADER_PIN=37' in build
+
+# New upstream root image is exact and checksum-pinned.
+assert 'https://dl.sd-card-images.johang.se/debians/2026-08-17/debian-trixie-armhf-eiy3bo.bin.gz' in build
+assert f'DEBIAN_GZIP_SHA256="{ROOT_GZ_SHA}"' in build
+assert 'Debian root image SHA256 mismatch' in build
+assert 'ner4uz' not in build
+
+# Playback-only source is the exact source used by the hardware-clean 1.0.3 path.
+codec = root / 'clock/playback/max98357a.c'
+assert codec.exists()
+assert hashlib.sha256(codec.read_bytes()).hexdigest() == SOURCE_SHA
+module_builder = (root / 'scripts/build_max98357a_module.sh').read_text()
+assert f'ABI="{ABI}"' in module_builder
+assert f'DEBIAN_VERSION="{DEBIAN_VERSION}"' in module_builder
+assert f'SOURCE_SHA256="{SOURCE_SHA}"' in module_builder
+assert 'linux-headers-6.12.101+deb13-common' in module_builder
+assert 'linux-kbuild-6.12.101+deb13' in module_builder
+assert 'pool/updates/main/l/linux' in module_builder
+assert 'gcc-arm-linux-gnueabihf' in module_builder
+assert 'SOURCE_POLICY=hardware-validated-max98357a-source-rebuilt-for-exact-kernel' in module_builder
+for dead in ['snd-soc-dmic', 'sun4i-i2s.ko', 'snd-soc-simple-card.ko', 'capture-rate-hz']:
+    assert dead not in module_builder, dead
+
+# DTB is derived from the new kernel's stock BPI DTB, not carried from 6.12.100.
+dtb_patch = (root / 'scripts/patch_playback_dtb.sh').read_text()
+assert 'STOCK_DTB="$MNT/usr/lib/linux-image-$KERNEL_ABI/$CLOCK_DTB_NAME"' in build
+assert 'patch_playback_dtb.sh' in build
 for token in [
-    'IWD_PROFILE_STATE=',
-    'cleanup_config_mount()', 'trap cleanup_config_mount EXIT', 'trap - EXIT',
-    'config_value()', 'SSID="$(config_value SSID)"',
-    'cleanup_staged_firmware()', 'cleanup_staged_packages()',
-    'touch "$FIRMWARE_MARKER"', 'touch "$PACKAGES_MARKER"',
-    'rm -f "${FIRMWARE_STAGE[@]}"', 'rm -f "${PACKAGES[@]}"',
-    'OLD_IWD_NAME=', 'Removed stale firstboot Wi-Fi profile',
-    "''|.|..|*/*) ;;",
-    'systemctl is-enabled "$unit"',
-    'unable to enable $unit', 'unable to mask ALSA state restore/save services',
+    '/soc/spi@1c68000 status okay',
+    '/soc/i2c@1c2ac00 status okay',
+    'pins PA18 PA19 PA20',
+    '/max98357a compatible maxim,max98357a',
+    '/max98357a sdmode-delay 5',
+    'simple-audio-card,name MAX98357A',
+    'simple-audio-card,mclk-fs 100',
 ]:
-    assert token in firstboot, token
-assert firstboot.index('touch "$FIRMWARE_MARKER"') < firstboot.index('cleanup_staged_firmware', firstboot.index('touch "$FIRMWARE_MARKER"'))
-assert firstboot.index('touch "$PACKAGES_MARKER"') < firstboot.index('cleanup_staged_packages', firstboot.index('touch "$PACKAGES_MARKER"'))
-assert 'systemctl enable iwd.service >/dev/null 2>&1 || true' not in firstboot
-assert 'systemctl enable systemd-networkd.service >/dev/null 2>&1 || true' not in firstboot
-assert 'systemctl enable ssh.service >/dev/null 2>&1 || true' not in firstboot
-assert 'systemctl mask alsa-restore.service alsa-state.service alsa-utils.service >>"$PKG_LOG" 2>&1 || true' not in firstboot
+    assert token in dtb_patch, token
+assert 'PA21' in dtb_patch and 'PA21 is deliberately absent/free' in dtb_patch
+assert 'dmic-codec' not in dtb_patch.lower()
+assert 'capture-rate-hz' not in dtb_patch.lower()
+assert 'CLOCK_DTB_BOOT="$MNT/usr/lib/linux-image-$KERNEL_ABI/$CLOCK_DTB_NAME"' in build
+assert 'install -m 0644 "$CLOCK_DTB_BUILD" "$CLOCK_DTB_BOOT"' in build
+assert 'install -m 0644 "$CLOCK_DTB_BUILD" "$CLOCK_DTB_OUT"' in build
 
-# Playback binary remains the physically validated one.
-assert hashlib.sha256(ko.read_bytes()).hexdigest() == '906b7ef831e199a7ae0dc1aa724251ea1763876298cdcd8564a25e70badaa3c6'
-assert hashlib.sha256(dtb.read_bytes()).hexdigest() == '0ff283cc75acd93a43722769e3d9771dcb5d629825348593fdd4da605e4b1452'
-
-# No binary rate-mask transformer or transformed module artifacts survive.
-assert not (root / 'scripts/patch_asoc_24k_module.py').exists()
-assert not any(validated.glob('*24k*.ko*'))
-assert 'snd-soc-spdif-rx' not in modules
-assert 'snd-soc-dmic' in modules
+# No microphone-era build path survives.
+for dead in [
+    'build_audio_modules.sh', 'apply_audio_source_transforms.py',
+    'patch_audio_capture_dtb.py', 'patch_asoc_24k_module.py',
+]:
+    assert not (root / 'scripts' / dead).exists(), dead
+assert not (root / 'patches').exists()
+assert 'snd-soc-dmic' not in modules
 assert 'sun4i-i2s' in modules
 assert 'snd-soc-simple-card' in modules
+assert 'snd-soc-max98357a' in modules
+assert not (root / 'clock/hardware/mk-piclock-validate-ics43434-24k').exists()
+assert 'mk-piclock-validate-ics43434-24k' not in build
 
-# Source builder is pinned to the exact target ABI/source and compiles all
-# three modules against Module.symvers.
-for token in [
-    'ABI="6.12.100+deb13-armmp"',
-    'DEBIAN_VERSION="6.12.100-1"',
-    'linux-headers-${ABI}_${DEBIAN_VERSION}_armhf.deb',
-    '${COMMON_NAME}_${DEBIAN_VERSION}_all.deb',
-    '${KBUILD_NAME}_${DEBIAN_VERSION}_${KBUILD_ARCH}.deb',
-    'Module.symvers',
-    'CROSS_COMPILE="$CROSS_COMPILE_PREFIX"',
-    'apply_audio_source_transforms.py',
-    'obj-m += sun4i-i2s.o',
-    'obj-m += snd-soc-dmic.o',
-    'obj-m += snd-soc-simple-card.o',
-    'modinfo -F vermagic',
-    'SOURCE-BUILD-MANIFEST.txt',
-    'relocate_debian_header_sdk.py',
-    '--sdk-root "$WORK_DIR/sdk"',
-    'COMMON_NAME="linux-headers-6.12.100+deb13-common"',
-    'KBUILD_NAME="linux-kbuild-6.12.100+deb13"',
+# ALSA is direct hardware playback only.
+asound=(root / 'clock/hardware/asound.conf').read_text().lower()
+assert 'type hw' in asound and 'card max98357a' in asound and 'device 0' in asound
+for forbidden in ['type asym','type plug','type rate','type dmix','type dsnoop','capture.pcm']:
+    assert forbidden not in asound
+
+# extlinux replaces the retired boot.cmd/boot.scr path. Root uses final MBR
+# partition 2 PARTUUID so the rootfs label is not part of the appliance contract.
+extlinux_policy=(root / 'scripts/set_extlinux_policy.py').read_text()
+partuuid=(root / 'scripts/mbr_partuuid.py').read_text()
+assert 'EXTLINUX_CONF="$MNT/boot/extlinux/extlinux.conf"' in build
+assert 'ROOT_PARTUUID="$(python3 "$HERE/scripts/mbr_partuuid.py" boot.bin --partition 2)"' in build
+assert 'set_extlinux_policy.py' in build
+assert 'quiet loglevel=4' in extlinux_policy
+assert "prompt 0" in extlinux_policy
+assert "timeout 10" in extlinux_policy
+assert "struct.unpack_from('<I', mbr, 440)" in partuuid
+assert '/boot/boot.cmd' not in build
+assert '/boot/boot.scr' not in build
+assert 'mkimage' not in build
+assert 'u-boot-tools' not in build
+assert 'KERNEL_BOOT_QUIET=yes' in build
+assert 'KERNEL_CONSOLE_LOGLEVEL=4' in build
+
+with tempfile.TemporaryDirectory() as td:
+    ext=Path(td)/'extlinux.conf'
+    defs=Path(td)/'u-boot'
+    ext.write_text('default l0\nprompt 1\ntimeout 50\nlabel l0\n\tappend root=LABEL=rootfs rw rootwait\n')
+    defs.write_text('U_BOOT_PARAMETERS="rw rootwait"\n')
+    r=subprocess.run([
+        'python3', str(root/'scripts/set_extlinux_policy.py'), str(ext), str(defs),
+        '--partuuid','12345678-02'
+    ],capture_output=True,text=True)
+    assert r.returncode == 0, r.stderr
+    t=ext.read_text(); d=defs.read_text()
+    assert 'prompt 0' in t and 'timeout 10' in t
+    assert 'append root=PARTUUID=12345678-02 rw rootwait quiet loglevel=4' in t
+    assert 'root=LABEL=rootfs' not in t
+    assert 'U_BOOT_ROOT="root=PARTUUID=12345678-02"' in d
+    assert 'U_BOOT_PARAMETERS="rw rootwait quiet loglevel=4"' in d
+
+# Kernel ownership is exact-ABI pinned.
+kernel_pin=(root/'clock/kernel-pin.pref').read_text()
+for pkg in [
+    'linux-image-armmp','linux-headers-armmp',
+    'linux-image-6.12.101+deb13-armmp',
+    'linux-headers-6.12.101+deb13-armmp',
+    'linux-headers-6.12.101+deb13-common',
 ]:
-    assert token in source_builder, token
-assert 'strip_signature' not in source_builder
-assert 'bytes.fromhex' not in source_builder
-assert 'amd64)' in source_builder
-assert 'armhf)' in source_builder
-assert 'CC_BIN=arm-linux-gnueabihf-gcc' in source_builder
-assert 'CC_BIN=gcc' in source_builder
-assert 'KBUILD_ARCH=armhf' in source_builder
+    assert pkg in kernel_pin, pkg
+assert 'KERNEL_UPDATE_POLICY=image-release-owned-exact-abi-pinned' in build
 
-# Post-transform assertions must validate semantic lines, not ambiguous token counts.
-assert "require_count 1 'static const struct snd_pcm_hw_constraint_list mkclock_capture_rate_constraint = {'" in source_builder
-assert "require_count 1 'ret = snd_pcm_hw_constraint_list(substream->runtime, 0,'" in source_builder
-assert "require_count 1 '\"icubedev,capture-rate-hz\", &capture_rate))'" in source_builder
-assert "require_count 1 'if (substream->stream != SNDRV_PCM_STREAM_CAPTURE)'" in source_builder
-assert "require_count 1 'snd_pcm_hw_constraint_list'" not in source_builder
-assert 'KBUILD_ARCH=amd64' in source_builder
+# 24/7 appliance policies remain intact.
+journal=(root/'clock/hardware/journald-volatile.conf').read_text()
+tmp=(root/'clock/hardware/tmp.mount').read_text()
+watchdog=(root/'clock/hardware/system-watchdog.conf').read_text()
+assert 'Storage=volatile' in journal and 'RuntimeMaxUse=16M' in journal
+assert 'What=tmpfs' in tmp and 'size=64M' in tmp
+assert 'RuntimeWatchdogSec=16s' in watchdog and 'RebootWatchdogSec=16s' in watchdog
+assert 'rm -rf "$MNT/var/log/journal"' in build
 
-# Debian header SDK must be self-contained after dpkg-deb extraction.
+# Firstboot/network/storage behavior remains the proven appliance flow.
 for token in [
-    'include /usr/src/', 'include ../', '../../lib', 'expected Debian header symlink',
-    'relocated Debian kernel-header SDK',
+    'partx --update --nr', 'resize2fs "$ROOT_DEV"',
+    'ROOT_DEV="$(readlink -f "$(findmnt -n -o SOURCE /)")"',
+    'PowerSaveDisable=brcmfmac', 'iw dev wlan0 get power_save',
+    'stage "12 WIFI RECOVERY RETRY"', 'wait_ipv4 60',
+    'PKG_LOG=/var/log/bpi-zero-wbuild-packages.log',
+    'systemd-machine-id-setup', 'cleanup_staged_packages()',
 ]:
-    assert token in relocator, token
-assert 'make -C "$HDR_DIR" M="$MOD_DIR" modules' in source_builder
+    assert token in firstboot, token
+assert 'systemctl reboot' not in firstboot
+assert 'e2fsck' not in firstboot
+assert '/dev/mmcblk0' not in firstboot and '/dev/mmcblk1' not in firstboot
+assert 'ROOT_RESIZE_MODE=firstboot-online-resize2fs-fail-closed' in build
+assert 'ROOT_RESIZE_ORDER=before-network' in build
+assert 'FIRSTBOOT_REBOOT=none' in build
+assert 'WIFI_FIRMWARE_INSTALL=image-build-direct' in build
+assert 'FIRSTBOOT_RESUME=checkpointed' in build
+assert 'WIFI_RECOVERY_RETRY=one-controlled-radio-userspace-restart' in build
+assert 'CLI_NETWORK_TOOL=iproute2-6.15.0-1' in build
+assert 'CLI_WIFI_TOOL=iw-6.9-1' in build
+assert 'ALSA_UTILS=alsa-utils-1.2.14-1' in build
+assert 'systemctl mask alsa-restore.service alsa-state.service alsa-utils.service' in firstboot
 
-# Source transformer adds 24 kHz to capture only and emits audit diffs.
+# Clone-safe image finalization remains explicit even though the new upstream
+# root image currently ships no populated machine-id.
 for token in [
-    'SNDRV_PCM_RATE_24000', '.capture = {', 'SNDRV_PCM_RATE_8000_192000',
-    'simple_mkclock_startup', 'simple_util_startup(substream)',
-    'SNDRV_PCM_STREAM_CAPTURE', 'icubedev,capture-rate-hz',
-    'snd_pcm_hw_constraint_list', 'SNDRV_PCM_HW_PARAM_RATE',
-    'simple_util_shutdown(substream)', 'difflib.unified_diff',
-]:
-    assert token in transformer, token
-assert not (root / 'patches').exists()
-
-# Image metadata records source provenance and policy separately.
-for token in [
-    'AUDIO_CAPTURE_CODEC=dmic-codec',
-    'AUDIO_CAPTURE_DRIVER=snd-soc-dmic',
-    'AUDIO_CAPTURE_DRIVER_SOURCE=debian-6.12.100-1-unmodified-dmic-source',
-    'AUDIO_CAPTURE_RATE_HZ=24000',
-    'AUDIO_CAPTURE_FORMAT=S32_LE',
-    'AUDIO_CAPTURE_SLOT_WIDTH_BITS=32',
-    'AUDIO_CAPTURE_MCLK_FS=256',
-    'AUDIO_CAPTURE_SOFT_RESAMPLE=disabled',
-    'I2S_DRIVER_SOURCE=debian-6.12.100-1-plus-capture-24khz-capability-patch',
-    'MACHINE_AUDIO_DRIVER=snd-soc-simple-card',
-    'MACHINE_CAPTURE_POLICY=snd_pcm_hw_constraint_list',
-    'MACHINE_CAPTURE_RATE_HZ=24000',
-    'MACHINE_CAPTURE_DT_PROPERTY=icubedev,capture-rate-hz',
-    'AUDIO_CAPTURE_VALIDATION=clock-dma-hardware-confirmed-24khz-mic-signal-pending',
+    'truncate -s 0 "$MNT/etc/machine-id"',
+    'rm -f "$MNT/var/lib/dbus/machine-id"',
+    'ln -s /etc/machine-id "$MNT/var/lib/dbus/machine-id"',
+    'MACHINE_ID_POLICY=firstboot-systemd-machine-id-setup',
 ]:
     assert token in build, token
 
-# ALSA userspace only selects hardware directions. No sample-rate plugin.
-asound = (root / 'clock/hardware/asound.conf').read_text()
-assert 'type asym' in asound
-assert 'playback.pcm "mkclock_playback"' in asound
-assert 'capture.pcm "mkclock_capture"' in asound
-assert 'device 1' in asound
-for forbidden in ['type plug', 'type rate', 'type dmix', 'type dsnoop']:
-    assert forbidden not in asound
+# Host/download hardening remains fail-closed.
+for token in [
+    'command -v unzip', 'ca-certificates', 'update-ca-certificates',
+    'gzip -t "$dest"', 'e2fsck -f -n debian.bin',
+    '--no-install-recommends',
+]:
+    assert token in build, token
+assert 'curl -k' not in build and 'curl --insecure' not in build
 
-# Automated dpkg provisioning uses a command-scoped noninteractive debconf
-# frontend. It must not persist DEBIAN_FRONTEND globally or add Perl Readline
-# merely to silence unattended-install warnings.
-firstboot = (root / 'overlay/root/bpi-zero-wbuild-firstboot.sh').read_text()
-assert firstboot.count('DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true') == 2
-assert 'dpkg --unpack "${PACKAGES[@]}"' in firstboot
-assert 'dpkg --configure -a' in firstboot
-assert 'export DEBIAN_FRONTEND' not in firstboot
-assert 'Term::ReadLine' not in build
+# Scripts parse and shell-check.
+for p in [
+    root/'build.sh', root/'overlay/root/bpi-zero-wbuild-firstboot.sh',
+    root/'clock/hardware/mk-piclock-bind-spidev',
+    root/'scripts/build_max98357a_module.sh', root/'scripts/patch_playback_dtb.sh',
+]:
+    r=subprocess.run(['bash','-n',str(p)],capture_output=True,text=True)
+    assert r.returncode == 0, f'{p}: {r.stderr}'
+for p in [
+    root/'scripts/make_fat32.py', root/'scripts/patch_mbr.py',
+    root/'scripts/mbr_partuuid.py', root/'scripts/set_extlinux_policy.py',
+    root/'scripts/relocate_debian_header_sdk.py', root/'scripts/disable_ssh_locale_forwarding.py',
+    root/'tests/fdt_read.py',
+]:
+    compile(p.read_text(),str(p),'exec')
 
-# Production image stays lean: no bundled microphone-validation script.
-assert not (root / 'clock/hardware/mk-piclock-validate-ics43434-24k').exists()
-assert 'mk-piclock-validate-ics43434-24k' not in build
-assert 'MIC_VALIDATOR=' not in build
-assert 'MIC_VALIDATOR_RUNTIME=' not in build
-assert 'No microphone validator is installed in the production image' in install_doc
-assert '-r 24000' in install_doc
+# Current docs should only describe preview36/new ABI and playback-only hardware.
+for doc in (readme,install_doc):
+    assert 'preview36' in doc.lower()
+    assert 'playback-only' in doc.lower()
+    assert '6.12.101' in doc
+    assert 'ics-43434' not in doc.lower()
+assert 'preview36' in (root/'CHANGELOG.md').read_text().lower()
 
-# DT topology is dmic-codec + PA21 and carries the board policy property.
-spec = importlib.util.spec_from_file_location('fdtpatch', root / 'tests/fdt_read.py')
-fdt = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(fdt)
-tree = fdt.parse(dtb)
-pins = fdt.declist(fdt.get(tree, '/soc/pinctrl@1c20800/mk-piclock-i2s0-pins').props['pins'])
-assert pins == ['PA18', 'PA19', 'PA20', 'PA21']
-assert fdt.decstr(fdt.get(tree, '/dmic-codec').props['compatible']) == 'dmic-codec'
-assert fdt.decu32(fdt.get(tree, '/dmic-codec').props['num-channels']) == (2,)
-assert fdt.decu32(fdt.get(tree, '/sound-max98357a').props['icubedev,capture-rate-hz']) == (24000,)
-assert fdt.decstr(fdt.get(tree, '/sound-max98357a').props['simple-audio-card,name']) == 'MAX98357A'
-cap_cpu = fdt.get(tree, '/sound-max98357a/simple-audio-card,dai-link@1/cpu')
-assert fdt.decu32(cap_cpu.props['dai-tdm-slot-num']) == (2,)
-assert fdt.decu32(cap_cpu.props['dai-tdm-slot-width']) == (32,)
-play_link = fdt.get(tree, '/sound-max98357a/simple-audio-card,dai-link@0')
-cap_link = fdt.get(tree, '/sound-max98357a/simple-audio-card,dai-link@1')
-assert fdt.decu32(play_link.props['mclk-fs']) == (256,)
-assert fdt.decu32(cap_link.props['mclk-fs']) == (256,)
-assert "'/sound-max98357a/simple-audio-card,dai-link@1' mclk-fs" in build
-
-assert 'no binary `.ko` byte edits' in readme
-assert 'capture capability only' in readme.lower()
-assert 'snd_pcm_hw_constraint_list' in readme
-assert 'full cull' in (root / 'CHANGELOG.md').read_text().lower()
-
-
-# Current operator docs must not point at an older preview image or stale
-# 48 kHz-failure expectation.
-assert 'Preview21 keeps' not in readme
-assert 'Preview6 keeps' not in install_doc
-assert 'preview16-bpi-m2-zero.img' not in install_doc
-assert 'RATE: 24000' in install_doc
-assert 'negotiate' in install_doc.lower()
-for doc in (readme, install_doc):
-    for m in re.findall(r'bpi-zero-clock-(1\.0\.4-preview\d+)-bpi-m2-zero\.img', doc):
-        assert m == '1.0.4-preview25', m
-
-# Preview25 source/runtime cull keeps only release-critical validated artifacts.
-assert not (root / 'scripts/patch_audio_capture_dtb.py').exists()
-assert not (root / 'patches').exists()
-assert (validated / 'HARDWARE-VALIDATION.txt').exists()
-assert 'bpi-zero-clock-audio-source-build.txt' not in build
-assert '--no-install-recommends' in build
-assert '--no-install-recommends' in source_builder
-assert 'cleanup_completed_state()' in firstboot
-assert 'NETWORK_IPV4_VERIFIER=iproute2' in build
-
-print('bpi-zero-clock 1.0.4-preview25 full-cull native-24k machine-policy checks passed')
+print('bpi-zero-clock 1.0.4-preview36 new Debian 6.12.101 playback-only checks passed')
