@@ -24,7 +24,7 @@ for line in lines:
         out.append('timeout 10'); seen_timeout=True
     elif re.match(r'^\s*append\s+', line):
         indent=line[:len(line)-len(line.lstrip())]
-        out.append(f'{indent}append root=PARTUUID={args.partuuid} rw rootwait quiet loglevel=4')
+        out.append(f'{indent}append root=PARTUUID={args.partuuid} rw rootwait loglevel=7 systemd.show_status=yes')
     else:
         out.append(line)
 if not seen_prompt:
@@ -42,7 +42,7 @@ def upsert(data, key, value):
 
 data = defs.read_text() if defs.exists() else ''
 data = upsert(data, 'U_BOOT_ROOT', f'root=PARTUUID={args.partuuid}')
-data = upsert(data, 'U_BOOT_PARAMETERS', 'rw rootwait quiet loglevel=4')
+data = upsert(data, 'U_BOOT_PARAMETERS', 'rw rootwait loglevel=7 systemd.show_status=yes')
 data = upsert(data, 'U_BOOT_PROMPT', '0')
 data = upsert(data, 'U_BOOT_TIMEOUT', '10')
 defs.write_text(data if data.endswith('\n') else data+'\n')

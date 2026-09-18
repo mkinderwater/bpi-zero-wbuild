@@ -1,0 +1,11 @@
+[Unit]
+Description=Expose SPI0 userspace device
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bpi-zero-bind-spidev
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

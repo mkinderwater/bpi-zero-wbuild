@@ -8,15 +8,15 @@
 #   - partition 1: FAT32 "BPIWBUILD" - editable CONFIG.TXT
 #                  (Wi-Fi + timezone + root password)
 #   - partition 2: ext4 root filesystem, with Wi-Fi/Bluetooth firmware,
-#                  first-boot resize/provisioning, SPI0, I2C0 and
-#                  playback-only I2S0/MAX98357A hardware support
+#                  first-boot resize/provisioning, GPIO, SPI0, I2C0 and
+#                  playback-only I2S0/MAX98357A support
 #
 # The upstream boot image ships a small placeholder partition
 # (its own file identifies it: PARTITION_INTENTIONALLY_EMPTY.TXT)
 # that the SoC's boot process does not use. This build drops it
 # entirely rather than carrying it forward -- see scripts/patch_mbr.py.
 #
-# Requirements: bash, python3, dpkg-deb, curl or wget, gzip, dtc/fdt tools,
+# Requirements: bash, python3, dpkg-deb, curl, gzip, dtc/fdt tools,
 # kmod, e2fsprogs and ca-certificates (usable CA trust bundle).
 # No mkfs.vfat/mtools/fdisk/parted required -- the FAT32
 # partition and MBR partition table are built by hand in
@@ -25,8 +25,7 @@
 # Usage:
 #   ./build.sh
 #
-# Override any of these via environment variables before running:
-#   BOOT_URL, DEBIAN_URL, OUT_DIR, WORK_DIR, CONFIG_PART_MB,
+# Optional build-location overrides: OUT_DIR and WORK_DIR.
 #
 set -euo pipefail
 
@@ -36,43 +35,34 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${BPI_ZERO_WBUILD_VERSION:-$(tr -d '\r\n' < "$HERE/VERSION")}"
+VERSION="$(tr -d '\r\n' < "$HERE/VERSION")"
 
-: "${BOOT_URL:=https://dl.sd-card-images.johang.se/boots/2026-08-01/boot-banana_pi_m2_zero.bin.gz}"
-: "${DEBIAN_URL:=https://dl.sd-card-images.johang.se/debians/2026-09-07/debian-trixie-armhf-pheiz3.bin.gz}"
-
-DEBIAN_BASE_NAME="$(basename "$DEBIAN_URL")"
-DEBIAN_BASE_NAME="${DEBIAN_BASE_NAME%.gz}"
-DEBIAN_BASE_NAME="${DEBIAN_BASE_NAME%.bin}"
-DEBIAN_IMAGE_DATE="$(printf '%s\n' "$DEBIAN_URL" | sed -nE 's#^.*/debians/([0-9]{4}-[0-9]{2}-[0-9]{2})/.*#\1#p')"
-[ -n "$DEBIAN_BASE_NAME" ] || { echo "ERROR: could not derive Debian base name from DEBIAN_URL." >&2; exit 1; }
+# Fixed 3.13 platform inputs. This release deliberately does not adapt itself to
+# arbitrary boot images, Debian roots or kernel ABIs.
+DEBIAN_URL="https://dl.sd-card-images.johang.se/debians/2026-09-07/debian-trixie-armhf-pheiz3.bin.gz"
+DEBIAN_SNAPSHOT_STAMP="20260907T235959Z"
+EXPECTED_KERNEL_ABI="6.12.107+deb13-armmp"
+EXPECTED_KERNEL_DEBIAN_VERSION="6.12.107-1"
 BOOT_GZIP_SHA256="e106b4cb5efdb9d3a559cd8ca192a2102807c8b80ce451e0333f770eb3fb2979"
-: "${FIRMWARE_DEB_URL:=https://ftp.debian.org/debian/pool/non-free-firmware/f/firmware-nonfree/firmware-brcm80211_20250410-2_all.deb}"
-: "${IWD_DEB_URL:=https://deb.debian.org/debian/pool/main/i/iwd/iwd_3.8-2_armhf.deb}"
-: "${LIBELL_DEB_URL:=https://deb.debian.org/debian/pool/main/e/ell/libell0_0.77-1_armhf.deb}"
-: "${LIBREADLINE_DEB_URL:=https://deb.debian.org/debian/pool/main/r/readline/libreadline8t64_8.2-6_armhf.deb}"
-: "${READLINE_COMMON_DEB_URL:=https://deb.debian.org/debian/pool/main/r/readline/readline-common_8.2-6_all.deb}"
-: "${WIRELESS_REGDB_DEB_URL:=https://deb.debian.org/debian/pool/main/w/wireless-regdb/wireless-regdb_2026.05.30-1~deb13u1_all.deb}"
-: "${LIBELF_DEB_URL:=https://deb.debian.org/debian/pool/main/e/elfutils/libelf1t64_0.192-4_armhf.deb}"
-: "${LIBBPF_DEB_URL:=https://deb.debian.org/debian/pool/main/libb/libbpf/libbpf1_1.5.0-3_armhf.deb}"
-: "${LIBMNL_DEB_URL:=https://deb.debian.org/debian/pool/main/libm/libmnl/libmnl0_1.0.5-3_armhf.deb}"
-: "${LIBDB_DEB_URL:=https://deb.debian.org/debian/pool/main/d/db5.3/libdb5.3t64_5.3.28+dfsg2-9_armhf.deb}"
-: "${LIBTIRPC_COMMON_DEB_URL:=https://deb.debian.org/debian/pool/main/libt/libtirpc/libtirpc-common_1.3.6+ds-1_all.deb}"
-: "${LIBTIRPC_DEB_URL:=https://deb.debian.org/debian/pool/main/libt/libtirpc/libtirpc3t64_1.3.6+ds-1_armhf.deb}"
-: "${LIBXTABLES_DEB_URL:=https://deb.debian.org/debian/pool/main/i/iptables/libxtables12_1.8.11-2_armhf.deb}"
-: "${LIBCAP2_BIN_DEB_URL:=https://deb.debian.org/debian/pool/main/libc/libcap2/libcap2-bin_2.75-10+deb13u1+b1_armhf.deb}"
-: "${IPROUTE2_DEB_URL:=https://deb.debian.org/debian/pool/main/i/iproute2/iproute2_6.15.0-1_armhf.deb}"
-: "${LIBNL3_DEB_URL:=https://deb.debian.org/debian/pool/main/libn/libnl3/libnl-3-200_3.7.0-2_armhf.deb}"
-: "${LIBNLGENL_DEB_URL:=https://deb.debian.org/debian/pool/main/libn/libnl3/libnl-genl-3-200_3.7.0-2_armhf.deb}"
-: "${IW_DEB_URL:=https://deb.debian.org/debian/pool/main/i/iw/iw_6.9-1_armhf.deb}"
-# AP6212 Bluetooth firmware is board firmware and is owned by the generalized
-# base image. Use the exact Banana Pi vendor payload validated on BPI-M2-Zero.
-# BlueZ userspace remains application-owned and is not installed here.
-BPI_WIFI_COMMIT=6dee7aabad92112e548b551c5acb9611d15e5b33
-: "${BT_HCD_URL:=https://raw.githubusercontent.com/BPI-SINOVOIP/BPI_WiFi_Firmware/${BPI_WIFI_COMMIT}/ap6212/bcm43438a1.hcd}"
-: "${WORK_DIR:=$HERE/build}"
-: "${OUT_DIR:=$HERE/out}"
-: "${CONFIG_PART_MB:=64}"   # size of the BPIWBUILD FAT32 partition
+
+# Runtime package set for the fixed Trixie platform. Format: URL|staged filename.
+FIRMWARE_SOURCE_URL="https://ftp.debian.org/debian/pool/non-free-firmware/f/firmware-nonfree/firmware-brcm80211_20250410-2_all.deb"
+FIRMWARE_SOURCE_SHA256="266cc703e2299f5253fd1ff9a1fd625d85a2c8e5a88b1a65fcc190ac384ce3d7"
+RUNTIME_PACKAGES=(
+    # Offline first-boot Wi-Fi userspace. Keep this set intentionally small and
+    # identical to the earlier BPI build that proved reliable on this board.
+    "https://deb.debian.org/debian/pool/main/i/iwd/iwd_3.8-2_armhf.deb|pkgroot/iwd_3.8-2_armhf.deb"
+    "https://deb.debian.org/debian/pool/main/e/ell/libell0_0.77-1_armhf.deb|pkgroot/libell0_0.77-1_armhf.deb"
+    "https://deb.debian.org/debian/pool/main/r/readline/libreadline8t64_8.2-6_armhf.deb|pkgroot/libreadline8t64_8.2-6_armhf.deb"
+    "https://deb.debian.org/debian/pool/main/r/readline/readline-common_8.2-6_all.deb|pkgroot/readline-common_8.2-6_all.deb"
+    "https://deb.debian.org/debian/pool/main/w/wireless-regdb/wireless-regdb_2026.05.30-1~deb13u1_all.deb|pkgroot/wireless-regdb_2026.05.30-1~deb13u1_all.deb"
+)
+
+BPI_WIFI_COMMIT="6dee7aabad92112e548b551c5acb9611d15e5b33"
+BT_HCD_URL="https://raw.githubusercontent.com/BPI-SINOVOIP/BPI_WiFi_Firmware/${BPI_WIFI_COMMIT}/ap6212/bcm43438a1.hcd"
+WORK_DIR="${WORK_DIR:-$HERE/build}"
+OUT_DIR="${OUT_DIR:-$HERE/out}"
+CONFIG_PART_SECTORS=131072  # 64 MiB
 
 mkdir -p "$WORK_DIR" "$OUT_DIR"
 cd "$WORK_DIR"
@@ -87,6 +77,7 @@ MISSING_HOST_PKGS=()
 command -v python3 >/dev/null 2>&1 || MISSING_HOST_PKGS+=(python3)
 command -v dpkg-deb >/dev/null 2>&1 || MISSING_HOST_PKGS+=(dpkg)
 command -v gzip >/dev/null 2>&1 || MISSING_HOST_PKGS+=(gzip)
+command -v findmnt >/dev/null 2>&1 || MISSING_HOST_PKGS+=(util-linux)
 command -v dtc >/dev/null 2>&1 || MISSING_HOST_PKGS+=(device-tree-compiler)
 command -v fdtget >/dev/null 2>&1 || MISSING_HOST_PKGS+=(device-tree-compiler)
 command -v fdtput >/dev/null 2>&1 || MISSING_HOST_PKGS+=(device-tree-compiler)
@@ -94,9 +85,7 @@ command -v depmod >/dev/null 2>&1 || MISSING_HOST_PKGS+=(kmod)
 command -v modinfo >/dev/null 2>&1 || MISSING_HOST_PKGS+=(kmod)
 command -v e2fsck >/dev/null 2>&1 || MISSING_HOST_PKGS+=(e2fsprogs)
 command -v tune2fs >/dev/null 2>&1 || MISSING_HOST_PKGS+=(e2fsprogs)
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    MISSING_HOST_PKGS+=(curl)
-fi
+command -v curl >/dev/null 2>&1 || MISSING_HOST_PKGS+=(curl)
 # HTTPS downloads require a usable CA trust bundle. Do not weaken TLS with -k.
 [ -s /etc/ssl/certs/ca-certificates.crt ] || MISSING_HOST_PKGS+=(ca-certificates)
 
@@ -122,9 +111,26 @@ fi
     exit 1
 }
 
+snapshot_fallback_url() {
+    local url="$1"
+    case "$url" in
+        https://deb.debian.org/debian/pool/*)
+            printf 'https://snapshot.debian.org/archive/debian/%s/%s\n' \
+                "$DEBIAN_SNAPSHOT_STAMP" "${url#https://deb.debian.org/debian/}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+download_once() {
+    local url="$1" dest="$2"
+    rm -f "$dest"
+    curl -fL --retry 3 -o "$dest" "$url"
+}
+
 fetch() {
     local url="$1" dest="$2"
-    local meta tmp meta_tmp cached_url=""
+    local meta tmp meta_tmp cached_url="" fallback=""
     meta="${dest}.source-url"
     tmp="${dest}.tmp.$$"
     meta_tmp="${meta}.tmp.$$"
@@ -143,29 +149,84 @@ fetch() {
         log "downloading: $(basename "$dest")"
     fi
 
+    fallback="$(snapshot_fallback_url "$url" 2>/dev/null || true)"
     rm -f "$tmp" "$meta_tmp"
-    if command -v curl >/dev/null 2>&1; then
-        if ! curl -fL --retry 3 -o "$tmp" "$url"; then
-            rm -f "$tmp"
+
+    if ! download_once "$url" "$tmp"; then
+        rm -f "$tmp"
+        if [ -n "$fallback" ]; then
+            echo "WARNING: primary download failed for $(basename "$dest"); retrying pinned Debian snapshot." >&2
+            echo "         Primary:  $url" >&2
+            echo "         Fallback: $fallback" >&2
+            if ! download_once "$fallback" "$tmp"; then
+                rm -f "$tmp"
+                echo "ERROR: failed to download $(basename "$dest")." >&2
+                echo "       Primary:  $url" >&2
+                echo "       Fallback: $fallback" >&2
+                return 1
+            fi
+        else
+            echo "ERROR: failed to download $(basename "$dest")." >&2
+            echo "       Primary:  $url" >&2
+            echo "       Fallback: none" >&2
             return 1
         fi
-    elif command -v wget >/dev/null 2>&1; then
-        if ! wget -O "$tmp" "$url"; then
-            rm -f "$tmp"
-            return 1
-        fi
-    else
-        echo "ERROR: neither curl nor wget is available." >&2
-        return 1
     fi
 
     mv -f "$tmp" "$dest"
+    # Cache identity remains the primary release URL even when snapshot.debian.org
+    # supplied the identical pinned pool object.
     printf '%s\n' "$url" > "$meta_tmp"
     mv -f "$meta_tmp" "$meta"
 }
 
+fetch_deb() {
+    local url="$1" dest="$2"
+    local filename stem expected_arch rest expected_pkg expected_version
+    local actual_pkg actual_version actual_version_no_epoch actual_arch
+
+    filename="${url##*/}"
+    case "$filename" in
+        *.deb) ;;
+        *)
+            echo "ERROR: Debian package URL does not end in .deb: $url" >&2
+            return 1
+            ;;
+    esac
+
+    stem="${filename%.deb}"
+    expected_arch="${stem##*_}"
+    rest="${stem%_*}"
+    expected_pkg="${rest%%_*}"
+    expected_version="${rest#*_}"
+    if [ "$rest" = "$expected_pkg" ] || [ -z "$expected_pkg" ] || \
+       [ -z "$expected_version" ] || [ -z "$expected_arch" ]; then
+        echo "ERROR: could not parse pinned Debian package filename: $filename" >&2
+        return 1
+    fi
+
+    fetch "$url" "$dest" || return 1
+
+    actual_pkg="$(dpkg-deb -f "$dest" Package 2>/dev/null || true)"
+    actual_version="$(dpkg-deb -f "$dest" Version 2>/dev/null || true)"
+    actual_arch="$(dpkg-deb -f "$dest" Architecture 2>/dev/null || true)"
+    actual_version_no_epoch="${actual_version#*:}"
+
+    if [ "$actual_pkg" != "$expected_pkg" ] || \
+       [ "$actual_version_no_epoch" != "$expected_version" ] || \
+       [ "$actual_arch" != "$expected_arch" ]; then
+        echo "ERROR: Debian package identity mismatch for $filename." >&2
+        echo "       Expected: Package=$expected_pkg Version=$expected_version Architecture=$expected_arch" >&2
+        echo "       Actual:   Package=${actual_pkg:-missing} Version=${actual_version:-missing} Architecture=${actual_arch:-missing}" >&2
+        rm -f "$dest" "${dest}.source-url"
+        return 1
+    fi
+
+    log "deb verified: $expected_pkg $actual_version $actual_arch"
+}
+
 # Fetch a gzip payload and verify the entire compressed stream before it is
-# accepted. curl/wget can successfully return a truncated/corrupt HTTP 200
+# accepted. A successful HTTP transfer can still return a truncated/corrupt
 # payload, and the URL cache alone cannot detect that. A failed integrity check
 # invalidates both the payload and its source-url marker so the next attempt is
 # guaranteed to perform a fresh download rather than reusing poisoned cache.
@@ -191,22 +252,24 @@ fetch_gzip() {
 }
 
 # ------------------------------------------------------------
-# 1. Download boot + root images, verify compressed streams, decompress
+# 1. Prepare the bundled boot image and pinned Debian root image.
 # ------------------------------------------------------------
-fetch_gzip "$BOOT_URL" boot.bin.gz
-fetch_gzip "$DEBIAN_URL" debian.bin.gz
-[ "$(sha256sum boot.bin.gz | awk '{print $1}')" = "$BOOT_GZIP_SHA256" ] || {
-    echo "ERROR: boot image SHA256 mismatch." >&2
+log "using bundled Banana Pi M2 Zero boot image"
+cp -f "$HERE/boot-banana_pi_m2_zero.bin.gz" boot.bin.gz
+gzip -t boot.bin.gz
+BOOT_ACTUAL_SHA256="$(sha256sum boot.bin.gz | awk '{print $1}')"
+[ "$BOOT_ACTUAL_SHA256" = "$BOOT_GZIP_SHA256" ] || {
+    echo "ERROR: bundled boot image SHA256 mismatch." >&2
     echo "       Expected: $BOOT_GZIP_SHA256" >&2
-    echo "       Actual:   $(sha256sum boot.bin.gz | awk '{print $1}')" >&2
+    echo "       Actual:   $BOOT_ACTUAL_SHA256" >&2
     exit 1
 }
-log "Debian root image accepted from configured trusted URL: $DEBIAN_URL"
+fetch_gzip "$DEBIAN_URL" debian.bin.gz
+DEBIAN_GZIP_OBSERVED_SHA256="$(sha256sum debian.bin.gz | awk '{print $1}')"
 
 log "decompressing boot/root images"
 gunzip -k -f boot.bin.gz
 gunzip -k -f debian.bin.gz
-CONFIG_PART_SECTORS=$(( CONFIG_PART_MB * 1024 * 1024 / 512 ))
 log "building final MBR layout early for PARTUUID/fstab/extlinux policy"
 python3 "$HERE/scripts/patch_mbr.py" \
     --boot-in boot.bin \
@@ -224,24 +287,24 @@ CONFIG_VOLID_HEX="$(python3 "$HERE/scripts/mbr_partuuid.py" boot_patched.bin --f
 # ------------------------------------------------------------
 rm -rf pkgroot
 mkdir -p pkgroot
-fetch "$FIRMWARE_DEB_URL" firmware-brcm80211.deb
-fetch "$IWD_DEB_URL" pkgroot/iwd_3.8-2_armhf.deb
-fetch "$LIBELL_DEB_URL" pkgroot/libell0_0.77-1_armhf.deb
-fetch "$LIBREADLINE_DEB_URL" pkgroot/libreadline8t64_8.2-6_armhf.deb
-fetch "$READLINE_COMMON_DEB_URL" pkgroot/readline-common_8.2-6_all.deb
-fetch "$WIRELESS_REGDB_DEB_URL" pkgroot/wireless-regdb_2026.05.30-1~deb13u1_all.deb
-fetch "$LIBELF_DEB_URL" pkgroot/libelf1t64_0.192-4_armhf.deb
-fetch "$LIBBPF_DEB_URL" pkgroot/libbpf1_1.5.0-3_armhf.deb
-fetch "$LIBMNL_DEB_URL" pkgroot/libmnl0_1.0.5-3_armhf.deb
-fetch "$LIBDB_DEB_URL" 'pkgroot/libdb5.3t64_5.3.28+dfsg2-9_armhf.deb'
-fetch "$LIBTIRPC_COMMON_DEB_URL" 'pkgroot/libtirpc-common_1.3.6+ds-1_all.deb'
-fetch "$LIBTIRPC_DEB_URL" 'pkgroot/libtirpc3t64_1.3.6+ds-1_armhf.deb'
-fetch "$LIBXTABLES_DEB_URL" pkgroot/libxtables12_1.8.11-2_armhf.deb
-fetch "$LIBCAP2_BIN_DEB_URL" 'pkgroot/libcap2-bin_2.75-10+deb13u1+b1_armhf.deb'
-fetch "$IPROUTE2_DEB_URL" pkgroot/iproute2_6.15.0-1_armhf.deb
-fetch "$LIBNL3_DEB_URL" pkgroot/libnl-3-200_3.7.0-2_armhf.deb
-fetch "$LIBNLGENL_DEB_URL" pkgroot/libnl-genl-3-200_3.7.0-2_armhf.deb
-fetch "$IW_DEB_URL" pkgroot/iw_6.9-1_armhf.deb
+fetch_deb "$FIRMWARE_SOURCE_URL" firmware-brcm80211.deb || {
+    echo "ERROR: required pinned firmware source package failed: $FIRMWARE_SOURCE_URL" >&2
+    exit 1
+}
+echo "$FIRMWARE_SOURCE_SHA256  firmware-brcm80211.deb" | sha256sum -c - >/dev/null || {
+    echo "ERROR: firmware-brcm80211 SHA-256 mismatch." >&2
+    rm -f firmware-brcm80211.deb firmware-brcm80211.deb.source-url
+    exit 1
+}
+log "firmware source SHA-256 verified"
+for spec in "${RUNTIME_PACKAGES[@]}"; do
+    url="${spec%%|*}"
+    dest="${spec#*|}"
+    fetch_deb "$url" "$dest" || {
+        echo "ERROR: required pinned Debian package failed validation: $url" >&2
+        exit 1
+    }
+done
 
 extract_deb_data() {
     local deb="$1" dest="$2"
@@ -258,6 +321,10 @@ BOARD_TXT="$FW_DIR/brcm/brcmfmac43430-sdio.sinovoip,bpi-m2-zero.txt"
 for f in "$CYPRESS_BIN" "$CYPRESS_CLM" "$BOARD_TXT"; do
     [ -s "$f" ] || { echo "ERROR: missing firmware payload $f"; exit 1; }
 done
+
+# cfg80211 can request regulatory.db as soon as the wireless stack probes, well
+# before firstboot installs wireless-regdb. Seed the exact database from the
+# pinned Debian package into the offline root, matching the proven 3.9 image.
 log "extracting regulatory.db from wireless-regdb"
 extract_deb_data pkgroot/wireless-regdb_2026.05.30-1~deb13u1_all.deb _regdb_extract
 REGDB="_regdb_extract/usr/lib/firmware/regulatory.db-upstream"
@@ -266,36 +333,28 @@ for f in "$REGDB" "$REGSIG"; do
     [ -s "$f" ] || { echo "ERROR: missing regulatory payload $f"; exit 1; }
 done
 log "fetching hardware-validated Banana Pi AP6212 Bluetooth HCD"
-fetch "$BT_HCD_URL" bpi-ap6212-bcm43438a1.hcd
+fetch "$BT_HCD_URL" bpi-ap6212-bcm43438a1.hcd || {
+    echo "ERROR: required Banana Pi AP6212 Bluetooth HCD download failed." >&2
+    echo "       URL: $BT_HCD_URL" >&2
+    exit 1
+}
 [ "$(stat -c %s bpi-ap6212-bcm43438a1.hcd)" -eq 33376 ] || {
     echo "ERROR: unexpected Banana Pi AP6212 Bluetooth HCD size" >&2
     exit 1
 }
-BT_FIRMWARE_SOURCE="BananaPi-AP6212-${BPI_WIFI_COMMIT}-board-specific"
+BT_HCD_OBSERVED_SHA256="$(sha256sum bpi-ap6212-bcm43438a1.hcd | awk '{print $1}')"
 
 # ------------------------------------------------------------
-# 3. Stage the overlay into pkgroot
+# 3. Stage the firstboot script and its offline package payload.
 # ------------------------------------------------------------
-# Stage only the one-shot firstboot script into /root. The systemd unit is
-# installed directly under /etc/systemd/system below, so a duplicate /root copy
-# has no runtime purpose. Build-cache *.source-url metadata is also build-host
-# state and must never enter the appliance rootfs.
-for src in "$HERE"/overlay/root/*.sh; do
-    [ -e "$src" ] || continue
-    case "$(basename "$src")" in
-        bpi-zero-wbuild-btfirmware.sh) continue ;;
-    esac
-    cp -f "$src" pkgroot/
-done
+install -m 0755 "$HERE/overlay/root/bpi-zero-wbuild-firstboot.sh" pkgroot/
 find pkgroot -maxdepth 1 -type f -name '*.source-url' -delete
-
-chmod 755 pkgroot/*.sh
-chmod 644 pkgroot/*.deb
+chmod 0644 pkgroot/*.deb
 
 # ------------------------------------------------------------
-# 4. Inject pkgroot into /root and install the first-boot unit.
-#    Root partition/filesystem expansion is the first operation performed by
-#    firstboot. It is fail-closed: no fsck/repair/reboot fallback is installed.
+# 4. Inject pkgroot into /root and install the firstboot unit.
+#    Root credential setup runs first. Storage growth is best effort and never
+#    blocks later Wi-Fi/SSH provisioning.
 # ------------------------------------------------------------
 log "injecting files into root filesystem (requires loop mount + root)"
 MNT="$WORK_DIR/_mnt_root"
@@ -311,31 +370,47 @@ ROOT_FS_TYPE="$(findmnt -n -o FSTYPE --target "$MNT" 2>/dev/null || true)"
 [ -f "$MNT/etc/fstab" ] || { echo "ERROR: target /etc/fstab is missing." >&2; exit 1; }
 python3 "$HERE/scripts/set_fstab_policy.py" "$MNT/etc/fstab" --partuuid "$ROOT_PARTUUID"
 
+# The bundled U-Boot boots this root through extlinux. Apply the policy to the
+# actual boot file and its u-boot-menu defaults, then validate both before the
+# image can continue.
+EXTLINUX_CONF="$MNT/boot/extlinux/extlinux.conf"
+U_BOOT_DEFAULTS="$MNT/etc/default/u-boot"
+[ -f "$EXTLINUX_CONF" ] || { echo "ERROR: target extlinux configuration is missing: /boot/extlinux/extlinux.conf" >&2; exit 1; }
+python3 "$HERE/scripts/set_extlinux_policy.py" "$EXTLINUX_CONF" "$U_BOOT_DEFAULTS" --partuuid "$ROOT_PARTUUID"
+grep -Eq "^[[:space:]]*append root=PARTUUID=${ROOT_PARTUUID} rw rootwait loglevel=7 systemd\.show_status=yes[[:space:]]*$" "$EXTLINUX_CONF" || {
+    echo "ERROR: extlinux root/console policy validation failed." >&2; exit 1;
+}
+grep -qxF "U_BOOT_ROOT=\"root=PARTUUID=${ROOT_PARTUUID}\"" "$U_BOOT_DEFAULTS" || { echo "ERROR: U_BOOT_ROOT policy validation failed." >&2; exit 1; }
+grep -qxF 'U_BOOT_PARAMETERS="rw rootwait loglevel=7 systemd.show_status=yes"' "$U_BOOT_DEFAULTS" || { echo "ERROR: U_BOOT_PARAMETERS policy validation failed." >&2; exit 1; }
+
 cp -f pkgroot/* "$MNT/root/"
-mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants" "$MNT/etc"
+mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
 
 cp -f "$HERE/overlay/root/bpi-zero-wbuild-firstboot.service" \
     "$MNT/etc/systemd/system/bpi-zero-wbuild-firstboot.service"
+# Banana Pi M2 Zero onboard Wi-Fi is a fixed board contract: brcmfmac -> wlan0.
+# Firstboot writes one iwd profile and a wlan0 DHCP rule. No custom Wi-Fi
+# service or runtime interface discovery is installed.
+mkdir -p "$MNT/etc/systemd/system/getty@tty1.service.d"
+cp -f "$HERE/overlay/root/getty-tty1-override.conf" \
+    "$MNT/etc/systemd/system/getty@tty1.service.d/override.conf"
 
-# Never ship host keys inherited from the pinned Debian root image. The
-# ExecStartPre pre-login barrier generates unique keys before ssh/getty proceed.
+# Login safety is account-state based, not getty ordering. Remove inherited
+# human accounts and lock root in the offline image. Firstboot replaces root's
+# locked hash only after CONFIG.TXT validates.
+python3 "$HERE/scripts/prepare_login_accounts.py" "$MNT"
+
+# Keep SSH out of the boot transaction until firstboot explicitly enables it.
+# This also avoids a harmless failed ssh.service while host keys are absent.
+rm -f "$MNT/etc/systemd/system/multi-user.target.wants/ssh.service"       "$MNT/etc/systemd/system/multi-user.target.wants/sshd.service"
+
+# Never ship host keys inherited from the pinned Debian root image. Firstboot
+# generates unique keys immediately after ROOT_PASSWORD validates.
 rm -f "$MNT"/etc/ssh/ssh_host_*
 
-# Keep the base image on a single first-boot provisioning path.
-# Bluetooth firmware is embedded directly, and root growth completes online.
-rm -f \
-    "$MNT/etc/systemd/system/bpi-zero-wbuild-btfirmware.service" \
-    "$MNT/etc/systemd/system/multi-user.target.wants/bpi-zero-wbuild-btfirmware.service" \
-    "$MNT/root/bpi-zero-wbuild-btfirmware.service" \
-    "$MNT/root/bpi-zero-wbuild-btfirmware.sh" \
-    "$MNT/etc/systemd/system/bpi-zero-wbuild-resizefs.service" \
-    "$MNT/etc/systemd/system/multi-user.target.wants/bpi-zero-wbuild-resizefs.service" \
-    "$MNT/root/bpi-zero-wbuild-resizefs.service" \
-    "$MNT/root/bpi-zero-wbuild-resizefs.sh"
-
-# Wi-Fi firmware is image-owned. Install the exact extracted payloads directly
-# into the rootfs so firstboot never stages/copies firmware or reloads brcmfmac
-# merely to make image contents available.
+# Wi-Fi firmware and the regulatory database required by cfg80211 are seeded
+# into the rootfs before first boot. wireless-regdb remains in the firstboot
+# package set so Debian owns/updates the database after provisioning.
 mkdir -p "$MNT/usr/lib/firmware/brcm"
 install -m 0644 "$REGDB" "$MNT/usr/lib/firmware/regulatory.db"
 install -m 0644 "$REGSIG" "$MNT/usr/lib/firmware/regulatory.db.p7s"
@@ -356,52 +431,49 @@ rm -rf _fw_extract _regdb_extract
 ln -sfn ../bpi-zero-wbuild-firstboot.service \
     "$MNT/etc/systemd/system/multi-user.target.wants/bpi-zero-wbuild-firstboot.service"
 
-mapfile -t KERNEL_ABIS < <(find "$MNT/lib/modules" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
-if [ "${#KERNEL_ABIS[@]}" -ne 1 ]; then
-    echo "ERROR: expected exactly one kernel ABI in target rootfs; found ${#KERNEL_ABIS[@]}." >&2
-    printf '       %s\n' "${KERNEL_ABIS[@]:-none}" >&2
-    exit 1
-fi
-KERNEL_ABI="${KERNEL_ABIS[0]}"
+KERNEL_ABI="$EXPECTED_KERNEL_ABI"
 KERNEL_PACKAGE="linux-image-$KERNEL_ABI"
+[ -d "$MNT/lib/modules/$KERNEL_ABI" ] || { echo "ERROR: target root is missing fixed kernel module tree $KERNEL_ABI." >&2; exit 1; }
 KERNEL_DEBIAN_VERSION="$(python3 "$HERE/scripts/dpkg_status_field.py" "$MNT/var/lib/dpkg/status" --package "$KERNEL_PACKAGE" --field Version)"
 KERNEL_PACKAGE_ARCH="$(python3 "$HERE/scripts/dpkg_status_field.py" "$MNT/var/lib/dpkg/status" --package "$KERNEL_PACKAGE" --field Architecture)"
-[ "$KERNEL_PACKAGE_ARCH" = armhf ] || { echo "ERROR: target kernel package architecture is $KERNEL_PACKAGE_ARCH, expected armhf." >&2; exit 1; }
+[ "$KERNEL_PACKAGE_ARCH" = armhf ] || { echo "ERROR: $KERNEL_PACKAGE architecture is $KERNEL_PACKAGE_ARCH, expected armhf." >&2; exit 1; }
+[ "$KERNEL_DEBIAN_VERSION" = "$EXPECTED_KERNEL_DEBIAN_VERSION" ] || { echo "ERROR: $KERNEL_PACKAGE version is $KERNEL_DEBIAN_VERSION, expected $EXPECTED_KERNEL_DEBIAN_VERSION." >&2; exit 1; }
+python3 "$HERE/scripts/dpkg_status_field.py" "$MNT/var/lib/dpkg/status" --package systemd-resolved --field Version >/dev/null || {
+    echo "ERROR: target root is missing systemd-resolved; DNS policy cannot be guaranteed." >&2; exit 1;
+}
 log "target kernel package: $KERNEL_PACKAGE $KERNEL_DEBIAN_VERSION ($KERNEL_PACKAGE_ARCH)"
 
 # ------------------------------------------------------------
-# Required hardware interfaces only: SPI0, I2C0 and playback-only MAX98357A.
-# GPIO remains the stock kernel interface; application lines are not claimed.
+# Reusable board baseline: SPI0, I2C0 and playback-only I2S0/MAX98357A.
+# The audio endpoint is part of the base hardware contract, not an application
+# service. PA1 is SD/EN and PA18/PA19/PA20 are reserved for I2S0 playback.
 # ------------------------------------------------------------
 DTB_NAME="sun8i-h2-plus-bananapi-m2-zero.dtb"
 STOCK_DTB="$MNT/usr/lib/linux-image-$KERNEL_ABI/$DTB_NAME"
-HW_BUILD_DIR="$WORK_DIR/required-hardware"
+HW_BUILD_DIR="$WORK_DIR/base-hardware"
 HW_DTB_BUILD="$HW_BUILD_DIR/$DTB_NAME"
-MAX98357A_BUILD_DIR="$HW_BUILD_DIR/max98357a"
 
 [ -s "$STOCK_DTB" ] || { echo "ERROR: stock Banana Pi DTB missing: ${STOCK_DTB#$MNT}" >&2; exit 1; }
 rm -rf "$HW_BUILD_DIR"
-mkdir -p "$HW_BUILD_DIR" "$MAX98357A_BUILD_DIR"
+mkdir -p "$HW_BUILD_DIR"
 
-log "enabling required SPI0 + I2C0 + MAX98357A hardware"
-bash "$HERE/scripts/patch_required_hardware_dtb.sh" "$STOCK_DTB" "$HW_DTB_BUILD"
+log "enabling SPI0 + I2C0 + I2S0/MAX98357A hardware baseline"
+bash "$HERE/scripts/patch_base_hardware_dtb.sh" "$STOCK_DTB" "$HW_DTB_BUILD"
 DTB_SHA256="$(sha256sum "$HW_DTB_BUILD" | awk '{print $1}')"
 
-log "building MAX98357A codec module for $KERNEL_ABI"
-MK_KERNEL_ABI="$KERNEL_ABI" MK_DEBIAN_LINUX_VERSION="$KERNEL_DEBIAN_VERSION" MK_DEBIAN_IMAGE_DATE="$DEBIAN_IMAGE_DATE" MK_MAX98357A_BUILD_OUT="$MAX98357A_BUILD_DIR" bash "$HERE/scripts/build_max98357a_module.sh"
+# MAX98357A is fixed to the known 6.12.107 kernel contract. There is no
+# generalized ABI builder in this release.
+MAX98357A_BUILD_DIR="$HW_BUILD_DIR/max98357a"
+mkdir -p "$MAX98357A_BUILD_DIR"
+log "building fixed MAX98357A module for $EXPECTED_KERNEL_ABI"
+MK_MAX98357A_BUILD_OUT="$MAX98357A_BUILD_DIR" bash "$HERE/scripts/build_max98357a_6_12_107.sh"
 MAX98357A_KO="$MAX98357A_BUILD_DIR/snd-soc-max98357a.ko"
-[ -s "$MAX98357A_KO" ] || { echo "ERROR: MAX98357A build output missing." >&2; exit 1; }
+[ -s "$MAX98357A_KO" ] || { echo "ERROR: fixed MAX98357A build output missing." >&2; exit 1; }
 MODULE_SHA256="$(sha256sum "$MAX98357A_KO" | awk '{print $1}')"
 MODULE_VERMAGIC="$(modinfo -F vermagic "$MAX98357A_KO" 2>/dev/null | awk '{print $1}')"
-[ "$MODULE_VERMAGIC" = "$KERNEL_ABI" ] || { echo "ERROR: MAX98357A vermagic mismatch." >&2; exit 1; }
+[ "$MODULE_VERMAGIC" = "$EXPECTED_KERNEL_ABI" ] || { echo "ERROR: MAX98357A vermagic '$MODULE_VERMAGIC' != '$EXPECTED_KERNEL_ABI'." >&2; exit 1; }
 [ "$(modinfo -F name "$MAX98357A_KO" 2>/dev/null)" = snd_soc_max98357a ] || { echo "ERROR: unexpected MAX98357A module name." >&2; exit 1; }
 modinfo -F alias "$MAX98357A_KO" 2>/dev/null | grep -q 'maxim,max98357a' || { echo "ERROR: MAX98357A OF alias missing." >&2; exit 1; }
-[ "$(fdtget -t s "$HW_DTB_BUILD" /max98357a compatible)" = maxim,max98357a ]
-[ "$(fdtget -t x "$HW_DTB_BUILD" /max98357a sdmode-delay)" = 5 ]
-[ "$(fdtget -t x "$HW_DTB_BUILD" /sound-max98357a simple-audio-card,mclk-fs)" = 100 ]
-[ "$(fdtget -t s "$HW_DTB_BUILD" /soc/pinctrl@1c20800/bpi-zero-i2s0-pins pins)" = 'PA18 PA19 PA20' ]
-[ "$(fdtget -t s "$HW_DTB_BUILD" /soc/i2c@1c2ac00 status)" = okay ]
-python3 "$HERE/scripts/check_gpio_ownership.py" "$HW_DTB_BUILD"
 python3 "$HERE/scripts/check_platform_aliases.py" "$HW_DTB_BUILD"
 python3 "$HERE/scripts/check_platform_pins.py" "$HW_DTB_BUILD"
 python3 "$HERE/scripts/check_bluetooth_topology.py" "$HW_DTB_BUILD"
@@ -409,7 +481,12 @@ python3 "$HERE/scripts/check_bluetooth_topology.py" "$HW_DTB_BUILD"
 DTB_BOOT="$MNT/usr/lib/linux-image-$KERNEL_ABI/$DTB_NAME"
 DTB_FIRMWARE="$MNT/usr/lib/firmware/$KERNEL_ABI/device-tree/$DTB_NAME"
 mkdir -p "$(dirname "$DTB_FIRMWARE")" "$MNT/lib/modules/$KERNEL_ABI/extra" "$MNT/etc/modules-load.d" "$MNT/usr/local/sbin" "$MNT/etc/systemd/system/multi-user.target.wants"
+
+# The fixed kernel ABI is held below. Replace the active DTB directly;
+# no dpkg diversion is needed for this fixed jump-point baseline.
 install -m 0644 "$HW_DTB_BUILD" "$DTB_BOOT"
+
+python3 "$HERE/scripts/hold_kernel_packages.py" "$MNT/var/lib/dpkg/status" --require "$KERNEL_PACKAGE"
 install -m 0644 "$HW_DTB_BUILD" "$DTB_FIRMWARE"
 install -m 0644 "$MAX98357A_KO" "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
 install -m 0644 "$HERE/hardware/modules-load.conf" "$MNT/etc/modules-load.d/bpi-zero-required-hardware.conf"
@@ -417,39 +494,38 @@ install -m 0755 "$HERE/hardware/bind-spidev" "$MNT/usr/local/sbin/bpi-zero-bind-
 install -m 0644 "$HERE/hardware/spidev.service" "$MNT/etc/systemd/system/bpi-zero-spidev.service"
 ln -sfn ../bpi-zero-spidev.service "$MNT/etc/systemd/system/multi-user.target.wants/bpi-zero-spidev.service"
 
-# Keep only the boot changes required by the assembled two-partition image.
-EXTLINUX_CONF="$MNT/boot/extlinux/extlinux.conf"
-U_BOOT_DEFAULTS="$MNT/etc/default/u-boot"
-[ -s "$EXTLINUX_CONF" ] || { echo "ERROR: extlinux.conf missing from Debian rootfs." >&2; exit 1; }
-python3 "$HERE/scripts/set_extlinux_policy.py" "$EXTLINUX_CONF" "$U_BOOT_DEFAULTS" --partuuid "$ROOT_PARTUUID"
-grep -Fxq 'prompt 0' "$EXTLINUX_CONF" || { echo "ERROR: extlinux prompt policy verification failed." >&2; exit 1; }
-grep -Fxq 'timeout 10' "$EXTLINUX_CONF" || { echo "ERROR: extlinux timeout policy verification failed." >&2; exit 1; }
-grep -Eq "^[[:space:]]*append root=PARTUUID=${ROOT_PARTUUID} rw rootwait quiet loglevel=4$" "$EXTLINUX_CONF" || { echo "ERROR: extlinux append policy verification failed." >&2; exit 1; }
-grep -Fqx "U_BOOT_ROOT=\"root=PARTUUID=${ROOT_PARTUUID}\"" "$U_BOOT_DEFAULTS" || { echo "ERROR: u-boot root policy verification failed." >&2; exit 1; }
-grep -Fqx 'U_BOOT_PARAMETERS="rw rootwait quiet loglevel=4"' "$U_BOOT_DEFAULTS" || { echo "ERROR: u-boot parameter policy verification failed." >&2; exit 1; }
-
 depmod -b "$MNT" "$KERNEL_ABI"
 validate_module_resolution() {
-    local mod="$1" expected="${2:-}" resolved
+    local mod="$1" expected="${2:-}" resolved resolved_rel expected_rel
     resolved="$(modinfo -b "$MNT" -k "$KERNEL_ABI" -n "$mod" 2>/dev/null || true)"
-    [ -n "$resolved" ] || { echo "ERROR: target kernel cannot resolve $mod." >&2; exit 1; }
-    if [ -n "$expected" ] && [ "$resolved" != "$expected" ]; then
-        echo "ERROR: $mod resolved to '$resolved', expected '$expected'." >&2; exit 1
+    [ -n "$resolved" ] || { echo "ERROR: target module index cannot resolve: $mod" >&2; exit 1; }
+    if [ -n "$expected" ]; then
+        resolved_rel="$resolved"
+        case "$resolved_rel" in
+            "$MNT"/*) resolved_rel="${resolved_rel#"$MNT"}" ;;
+        esac
+        expected_rel="${expected#"$MNT"}"
+        if [ "$resolved_rel" != "$expected_rel" ]; then
+            echo "ERROR: $mod resolves to '$resolved' (${resolved_rel}), expected '$expected' (${expected_rel})." >&2
+            exit 1
+        fi
     fi
     modprobe -d "$MNT" -S "$KERNEL_ABI" -n "$mod" >/dev/null 2>&1 || { echo "ERROR: unresolved module/dependency: $mod" >&2; exit 1; }
 }
-validate_module_resolution snd-soc-max98357a "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
+MAX98357A_MODULE_FILE="$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko"
+validate_module_resolution snd-soc-max98357a "$MAX98357A_MODULE_FILE"
 validate_module_resolution sun4i-i2s
 validate_module_resolution snd-soc-simple-card
 validate_module_resolution spidev
 validate_module_resolution i2c-dev
+validate_module_resolution brcmfmac
 validate_module_resolution hci_uart
 validate_module_resolution btbcm
 [ "$(sha256sum "$DTB_BOOT" | awk '{print $1}')" = "$DTB_SHA256" ]
 [ "$(sha256sum "$DTB_FIRMWARE" | awk '{print $1}')" = "$DTB_SHA256" ]
-[ "$(sha256sum "$MNT/lib/modules/$KERNEL_ABI/extra/snd-soc-max98357a.ko" | awk '{print $1}')" = "$MODULE_SHA256" ]
+[ "$(sha256sum "$MAX98357A_MODULE_FILE" | awk '{print $1}')" = "$MODULE_SHA256" ]
 
-# Appliance SD-card safety: do not ship the builder's persistent journal.
+# SD-card safety: do not ship the builder's persistent journal.
 rm -rf "$MNT/var/log/journal"
 mkdir -p "$MNT/etc/systemd/journald.conf.d"
 cat >"$MNT/etc/systemd/journald.conf.d/20-bpi-zero-volatile.conf" <<'EOF_JOURNAL'
@@ -463,28 +539,39 @@ cat >"$MNT/etc/bpi-zero-wbuild-release" <<EOF_BASE_RELEASE
 PRODUCT=bpi-zero-wbuild
 VERSION=$VERSION
 TARGET=bpi-m2-zero
-BASE=$DEBIAN_BASE_NAME
+BASE=debian-trixie-armhf-pheiz3
 DEBIAN_SOURCE_URL=$DEBIAN_URL
-DEBIAN_IMAGE_DATE=${DEBIAN_IMAGE_DATE:-unknown}
+DEBIAN_IMAGE_DATE=2026-09-07
 KERNEL_ABI=$KERNEL_ABI
 KERNEL_DEBIAN_VERSION=$KERNEL_DEBIAN_VERSION
+BOOT_SOURCE=bundled-source-archive
 BOOT_GZIP_SHA256=$BOOT_GZIP_SHA256
-DEBIAN_SOURCE_TRUST=configured-https-url-no-pinned-hash
+DEBIAN_SOURCE_TRUST=fixed-https-url-gzip-verified;sha256-pin-pending-upstream-hash
+DEBIAN_GZIP_OBSERVED_SHA256=$DEBIAN_GZIP_OBSERVED_SHA256
+WIFI_DRIVER=brcmfmac
+WIFI_INTERFACE=wlan0
+GPU_POLICY=headless-disabled-mali400
 WIFI_FIRMWARE_SOURCE=Debian-firmware-brcm80211-20250410-2
 WIFI_FIRMWARE_INSTALL=image-build-direct
-BLUETOOTH_FIRMWARE_SOURCE=$BT_FIRMWARE_SOURCE
+BLUETOOTH_FIRMWARE_SOURCE=BananaPi-AP6212-${BPI_WIFI_COMMIT}-board-specific
+BLUETOOTH_FIRMWARE_TRUST=commit-pinned-size-validated;sha256-pin-pending
+BLUETOOTH_FIRMWARE_OBSERVED_SHA256=$BT_HCD_OBSERVED_SHA256
 BLUETOOTH_FIRMWARE_PATH=brcm/BCM43430A1.sinovoip,bpi-m2-zero.hcd
-BLUETOOTH_USERSPACE=application-owned
-ROOT_RESIZE_MODE=firstboot-online-resize2fs-fail-closed
+BLUETOOTH_USERSPACE=not-installed-by-base
+ROOT_RESIZE_MODE=firstboot-online-resize2fs-nonfatal-retry-until-success
 SPI_ALIAS=spi0
 SPI_DEVICE=/dev/spidev0.0
 I2C_ALIAS=i2c0
 I2C_DEVICE=/dev/i2c-0
 GPIO_DEVICE=/dev/gpiochip0
+BASE_DTB_SHA256=$DTB_SHA256
 AUDIO_ENDPOINT=MAX98357A
 AUDIO_CODEC_DRIVER=snd-soc-max98357a
+MAX98357A_MODULE_SOURCE=fixed-release-build-6.12.107
 MAX98357A_MODULE_SHA256=$MODULE_SHA256
 MAX98357A_DTB_SHA256=$DTB_SHA256
+KERNEL_UPDATE_POLICY=dpkg-hold-fixed-kernel
+DTB_UPDATE_POLICY=kernel-held-active-dtb
 MAX98357A_VERMAGIC=$MODULE_VERMAGIC
 MAX98357A_SD_GPIO=PA1
 MAX98357A_SD_DELAY_MS=5
@@ -492,18 +579,21 @@ MAX98357A_MCLK_FS=256
 I2S_LRCLK_GPIO=PA18
 I2S_BCLK_GPIO=PA19
 I2S_TX_GPIO=PA20
-APPLICATION_GPIO_OWNERSHIP=PA0,PA2,PA7,PA8,PA9,PA17-unclaimed-by-image
+GPIO_POLICY=board-default-plus-spi0-i2c0-i2s0-max98357a
 CONFIG_SECRET_POLICY=PSK-and-ROOT_PASSWORD-blanked-after-successful-firstboot
-PRELOGIN_SECURITY=root-password-account-prune-and-ssh-host-keys-before-getty-or-ssh
+LOGIN_SECURITY=offline-root-lock-and-human-account-prune;firstboot-root-password-and-ssh-host-key-setup
+CONSOLE_LOGIN_POLICY=getty-may-start-while-root-locked;firstboot-unlocks-root
 LOGIN_POLICY=root-only
 LOGIN_ACCOUNT=root-only
-HARDWARE_SCOPE=wifi-bluetooth-resize-spi-i2c-gpio-i2s-max98357a
+BOOT_CONSOLE=verbose-kernel-and-systemd-status
+TTY1_NETWORK_INFO=/etc/issue.d-dynamic-ip-no-boot-wait
+HARDWARE_SCOPE=wifi-bluetooth-spi-i2c-gpio-i2s-max98357a;resize-best-effort
 EOF_BASE_RELEASE
 chmod 0644 "$MNT/etc/bpi-zero-wbuild-release"
 
 # Clone-safe machine identity. Normalize the upstream rootfs regardless of
 # whether it ships /etc/machine-id absent, empty, or populated. Every flashed
-# clock must generate its own persistent identity. Leave /etc/machine-id
+# device must generate its own persistent identity. Leave /etc/machine-id
 # present but empty. Firstboot Stage 05 explicitly runs
 # systemd-machine-id-setup, and the legacy D-Bus path references that same ID.
 log "resetting image machine-id for first-boot generation"
@@ -540,7 +630,7 @@ log "root filesystem state: clean"
 # ------------------------------------------------------------
 # 5. Build the BPIWBUILD FAT32 config partition
 # ------------------------------------------------------------
-log "building BPIWBUILD FAT32 partition ($CONFIG_PART_MB MiB)"
+log "building BPIWBUILD FAT32 partition (64 MiB)"
 python3 "$HERE/scripts/make_fat32.py" bpiwbuild-config.fat32 "$CONFIG_PART_SECTORS" \
     "$HERE/config/CONFIG.TXT.template" \
     --hidden-sectors "$CONFIG_START_SECTOR" \
@@ -560,6 +650,9 @@ python3 "$HERE/scripts/make_fat32.py" bpiwbuild-config.fat32 "$CONFIG_PART_SECTO
 # ------------------------------------------------------------
 OUT_GZ="$OUT_DIR/bpi-zero-wbuild-$VERSION-bpi-m2-zero.img.gz"
 TMP_GZ="$OUT_GZ.tmp.$$"
+# Remove same-version raw artifacts left by older builders so out/ reflects the compressed-only contract.
+rm -f "$OUT_DIR/bpi-zero-wbuild-$VERSION-bpi-m2-zero.img" \
+      "$OUT_DIR/bpi-zero-wbuild-$VERSION-bpi-m2-zero.img.sha256"
 RAW_IMAGE_BYTES=$(( $(stat -c %s boot_patched.bin) + $(stat -c %s bpiwbuild-config.fat32) + $(stat -c %s debian.bin) ))
 log "streaming final card image directly to $(basename "$OUT_GZ")"
 log "logical uncompressed image size: $RAW_IMAGE_BYTES bytes"

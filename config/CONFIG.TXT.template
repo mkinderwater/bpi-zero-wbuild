@@ -6,6 +6,10 @@
 # COUNTRY  two-letter country code, e.g. CA or US
 # HIDDEN   true or false
 # TIMEZONE IANA timezone name
+# ROOT_PASSWORD password for the only login account (root), 8-64 characters
+#
+# SECURITY: after successful firstboot, PSK= and ROOT_PASSWORD= are automatically
+# blanked on this FAT32 partition. The installed iwd profile remains root-only.
 #
 # Common timezone examples:
 # America/Edmonton, America/Vancouver, America/Winnipeg, America/Toronto,
@@ -18,3 +22,4 @@ PSK=
 COUNTRY=CA
 HIDDEN=false
 TIMEZONE=America/Edmonton
+ROOT_PASSWORD=

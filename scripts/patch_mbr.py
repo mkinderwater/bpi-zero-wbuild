@@ -57,6 +57,8 @@ def main():
     with open(args.boot_in, "rb") as f:
         boot = bytearray(f.read())
 
+    if len(boot) < 512:
+        raise SystemExit(f"boot-in is too short for an MBR: {len(boot)} bytes")
     if boot[510:512] != b"\x55\xaa":
         raise SystemExit("boot-in does not look like a valid MBR (missing 55AA signature)")
 
@@ -66,6 +68,14 @@ def main():
         raise SystemExit("partition 1 is empty in boot-in; can't determine the pre-partition gap size")
 
     pre_partition_gap = p1_orig["lba"]  # sectors before the (discarded) placeholder partition
+    required_boot_bytes = pre_partition_gap * 512
+    if len(boot) < required_boot_bytes:
+        raise SystemExit(
+            f"boot-in is shorter than its own pre-partition gap: "
+            f"{len(boot)} < {required_boot_bytes} bytes"
+        )
+    original_prefix = bytes(boot[:446])
+    original_signature = bytes(boot[510:512])
 
     debian_size = os.path.getsize(args.debian_in)
     if debian_size % 512 != 0:
@@ -86,7 +96,10 @@ def main():
     assert len(new_entries) == 64
 
     boot[446:446 + 64] = new_entries
-    assert boot[510:512] == b"\x55\xaa"
+    if bytes(boot[:446]) != original_prefix:
+        raise SystemExit("internal error: patch changed bytes 0-445; refusing output")
+    if bytes(boot[510:512]) != original_signature or original_signature != b"\x55\xaa":
+        raise SystemExit("internal error: patch changed MBR signature; refusing output")
 
     # Only the raw area up through the start of partition 1 is meaningful now;
     # the old placeholder partition's own data (after that point) is discarded.

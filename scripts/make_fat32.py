@@ -9,12 +9,24 @@ import struct
 import sys
 import datetime
 import os
+import argparse
 
-OUT_PATH = sys.argv[1] if len(sys.argv) > 1 else "bpiwbuild-config.fat32"
-PART_SECTORS = int(sys.argv[2]) if len(sys.argv) > 2 else 131072  # 64 MiB
-CONFIG_TEMPLATE = sys.argv[3] if len(sys.argv) > 3 else os.path.join(
-    os.path.dirname(__file__), "..", "config", "CONFIG.TXT.template"
-)
+ap = argparse.ArgumentParser()
+ap.add_argument("output")
+ap.add_argument("sectors", type=int)
+ap.add_argument("config_template")
+ap.add_argument("--hidden-sectors", type=lambda x: int(x, 0), required=True)
+ap.add_argument("--volume-id", type=lambda x: int(x, 0), required=True)
+args = ap.parse_args()
+OUT_PATH = args.output
+PART_SECTORS = args.sectors
+CONFIG_TEMPLATE = args.config_template
+HIDDEN_SECTORS = args.hidden_sectors
+VOLUME_ID = args.volume_id
+if not 0 <= HIDDEN_SECTORS <= 0xFFFFFFFF:
+    raise SystemExit("hidden-sectors out of FAT32 BPB range")
+if not 1 <= VOLUME_ID <= 0xFFFFFFFF:
+    raise SystemExit("volume-id must be non-zero uint32")
 
 BYTES_PER_SECTOR = 512
 SEC_PER_CLUSTER = 1          # 512-byte clusters -> guarantees ClusterCount >= 65525 (true FAT32)
@@ -29,7 +41,8 @@ with open(CONFIG_TEMPLATE, "rb") as f:
 README_TXT = b"""This partition holds the configuration for bpi-zero-wbuild.
 
 1. Open CONFIG.TXT in a text editor.
-2. Fill in SSID, PSK, COUNTRY, HIDDEN, and (optionally) TIMEZONE.
+2. Fill in SSID, PSK, COUNTRY, HIDDEN, ROOT_PASSWORD, and (optionally) TIMEZONE.
+   ROOT_PASSWORD is required and must be 8-64 characters.
 3. Save the file back to this drive.
 4. Eject/safely-remove this drive, put the SD card in the board, and
    power it on.
@@ -89,7 +102,7 @@ def build():
     struct.pack_into("<H", bs, 22, 0)      # FATSz16 = 0 for FAT32
     struct.pack_into("<H", bs, 24, 63)     # SecPerTrk (legacy, unused)
     struct.pack_into("<H", bs, 26, 255)    # NumHeads (legacy, unused)
-    struct.pack_into("<I", bs, 28, 0)      # HiddSec (partition-relative image; 0)
+    struct.pack_into("<I", bs, 28, HIDDEN_SECTORS)  # HiddSec = final disk LBA start
     struct.pack_into("<I", bs, 32, total_sectors)  # TotSec32
     struct.pack_into("<I", bs, 36, fat_size)   # FATSz32
     struct.pack_into("<H", bs, 40, 0)          # ExtFlags (mirrored FATs)
@@ -100,7 +113,7 @@ def build():
     bs[64] = 0x80                              # DrvNum
     bs[65] = 0                                 # Reserved1
     bs[66] = 0x29                              # BootSig
-    struct.pack_into("<I", bs, 67, 0x12345678)  # VolID
+    struct.pack_into("<I", bs, 67, VOLUME_ID)  # stable image-specific VolID
     bs[71:82] = VOLUME_LABEL.ljust(11)[:11].encode("ascii")
     bs[82:90] = b"FAT32   "
     bs[510] = 0x55

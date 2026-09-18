@@ -4,113 +4,147 @@ set -euo pipefail
 LOG=/var/log/bpi-zero-wbuild-firstboot.log
 PKG_LOG=/var/log/bpi-zero-wbuild-packages.log
 MARKER=/var/lib/bpi-zero-wbuild-firstboot.done
-STATUS_FILE=/var/lib/bpi-zero-wbuild-status
-STATE_DIR=/var/lib/bpi-zero-wbuild-firstboot
+READY_MARKER=/var/lib/bpi-zero-wbuild-ready-to-finalize.done
 RESIZE_MARKER=/var/lib/bpi-zero-wbuild-resize.done
-IDENTITY_MARKER="$STATE_DIR/identity.done"
-SSH_MARKER="$STATE_DIR/ssh.done"
-PACKAGES_MARKER="$STATE_DIR/packages.done"
-IWD_PROFILE_STATE="$STATE_DIR/iwd-profile"
+CFG_MNT=/mnt/bpi-zero-wbuild-config
+CFG_DEV=/dev/disk/by-label/BPIWBUILD
+WIFI_IF=wlan0
+PACKAGES=(
+  /root/readline-common_8.2-6_all.deb
+  /root/libreadline8t64_8.2-6_armhf.deb
+  /root/libell0_0.77-1_armhf.deb
+  /root/wireless-regdb_2026.05.30-1~deb13u1_all.deb
+  /root/iwd_3.8-2_armhf.deb
+)
 
-mkdir -p "$STATE_DIR"
-touch "$LOG"
-exec >>"$LOG" 2>&1
+mkdir -p /var/lib
+exec > >(tee -a "$LOG") 2>&1
 
-console_line() {
-    # Stage-level appliance progress belongs on the physical console. Full
-    # command/package chatter remains in the persistent firstboot/package logs.
-    printf '%s\n' "$*" 2>/dev/null >/dev/console || true
-}
-
-stage() {
-    echo
-    echo "[BPI-ZERO-WBUILD] $*"
-    console_line "[BPI-ZERO-WBUILD] $*"
-}
-
-note() {
-    echo "$*"
-    console_line "  $*"
-}
+stage() { echo; echo "[BPI-ZERO-WBUILD] $*"; }
+note() { echo "$*"; }
 
 write_status() {
-    local state="$1" wifi="${2:-pending}" ipv4="${3:-NONE}"
-    {
-        printf 'FIRSTBOOT=%s\n' "$state"
-        printf 'WIFI=%s\n' "$wifi"
-        printf 'IPV4=%s\n' "$ipv4"
-    } >"$STATUS_FILE"
+    printf 'FIRSTBOOT=%s\nWIFI=%s\nIPV4=%s\n' "$1" "${2:-pending}" "${3:-NONE}" \
+        >/var/lib/bpi-zero-wbuild-status
 }
 
 fail() {
     echo "ERROR: $*"
     write_status failed unknown NONE
-    printf 'ERROR=%s\n' "$*" >>"$STATUS_FILE"
-    console_line "  ERROR: $*"
+    printf 'ERROR=%s\n' "$*" >>/var/lib/bpi-zero-wbuild-status
     exit 1
 }
 
-cleanup_completed_state() {
-    # Once the final completion marker exists, intermediate resume checkpoints
-    # are dead state. Keep the final marker and logs for provenance.
-    rm -rf "$STATE_DIR"
-    rm -f "$RESIZE_MARKER"
+ipv4_for_wlan0() {
+    SYSTEMD_COLORS=0 networkctl status wlan0 --no-pager 2>/dev/null | awk '
+        /Address:/ {
+            for (i=2; i<=NF; i++) {
+                candidate=$i
+                sub(/\/[0-9]+$/, "", candidate)
+                if (candidate ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                    print candidate; exit
+                }
+            }
+        }' || true
 }
 
-write_status running pending NONE
-stage "01 FIRSTBOOT SERVICE STARTED"
-date -Is 2>/dev/null || date
-echo "Clock may be unsynchronized until networking is available."
+start_ssh() {
+    systemctl is-active --quiet ssh.service 2>/dev/null && return 0
+    systemctl start ssh.service || fail "unable to start SSH."
+    systemctl is-active --quiet ssh.service || fail "SSH did not become active."
+}
 
-if [ -e "$MARKER" ]; then
-    # A completed marker is authoritative. If power was lost between marker
-    # commit and service disable, finish that harmless cleanup on this boot.
-    systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
-        fail "provisioning is complete but firstboot service could not be disabled."
-    cleanup_completed_state
-    write_status complete connected "$(ip -4 -o addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
-    note "Provisioning already complete; firstboot service disabled; intermediate checkpoints removed."
-    exit 0
-fi
+mount_config() {
+    local mode="$1"
+    mkdir -p "$CFG_MNT"
+    udevadm settle --timeout=10 2>/dev/null || true
+    [ -b "$CFG_DEV" ] || fail "BPIWBUILD partition is not available at $CFG_DEV."
+    mount -t vfat -o "$mode" "$CFG_DEV" "$CFG_MNT" || fail "unable to mount BPIWBUILD ($mode)."
+}
 
-# ---------------------------------------------------------------------------
-# Root partition/filesystem growth. Once verified, never repeat it merely
-# because a later network stage failed.
-# ---------------------------------------------------------------------------
-stage "02 ROOT FILESYSTEM CAPACITY"
-if [ -e "$RESIZE_MARKER" ]; then
-    note "Root resize already complete; checkpoint reused."
-    df -h /
-else
-    ROOT_DEV="$(readlink -f "$(findmnt -n -o SOURCE /)")"
-    PARTNUM="$(lsblk -no PARTN "$ROOT_DEV" | tr -d '[:space:]')"
-    PKNAME="$(lsblk -no PKNAME "$ROOT_DEV" | tr -d '[:space:]')"
+cleanup_config_mount() {
+    mountpoint -q "$CFG_MNT" && umount "$CFG_MNT" || true
+}
+trap cleanup_config_mount EXIT
 
-    [ -n "$ROOT_DEV" ] || fail "unable to determine root device."
-    [ -n "$PARTNUM" ] || fail "unable to determine root partition number for $ROOT_DEV."
-    [ -n "$PKNAME" ] || fail "unable to determine parent disk for $ROOT_DEV."
-    DISK="/dev/$PKNAME"
-    TOTAL_SECTORS="$(blockdev --getsz "$DISK")"
-    ROOT_BASENAME="$(basename "$ROOT_DEV")"
-    PART_START="$(cat "/sys/class/block/$ROOT_BASENAME/start")"
-    KERNEL_BEFORE="$(blockdev --getsz "$ROOT_DEV")"
+scrub_config_secrets() {
+    local config tmp rc
+    cleanup_config_mount
+    mount_config "rw,sync,umask=0077"
+    config="$CFG_MNT/CONFIG.TXT"
 
-    printf '%s' "$TOTAL_SECTORS" | grep -Eq '^[0-9]+$' || fail "invalid disk sector geometry."
-    printf '%s' "$PART_START" | grep -Eq '^[0-9]+$' || fail "invalid partition start geometry."
-    EXPECTED_SECTORS=$((TOTAL_SECTORS - PART_START))
-    [ "$EXPECTED_SECTORS" -gt 0 ] || fail "invalid expected root partition size."
+    # A power loss may leave a previous temporary replacement behind. It is
+    # never authoritative; remove it before evaluating the durable CONFIG.TXT.
+    rm -f -- "$CFG_MNT"/.CONFIG.TXT.scrub.* 2>/dev/null || true
 
-    cat <<EOF_GEOMETRY
-Root partition:        $ROOT_DEV
-Parent disk:           $DISK
-Partition no.:         $PARTNUM
-Partition start:       $PART_START
-Disk sectors:          $TOTAL_SECTORS
-Kernel sectors before: $KERNEL_BEFORE
-Expected root sectors: $EXPECTED_SECTORS
-EOF_GEOMETRY
+    # Once ready-to-finalize is committed, a missing CONFIG.TXT or a file with
+    # neither credential key is already safe from plaintext credential reuse.
+    # Do not wedge an otherwise-complete system because the FAT update was
+    # interrupted or an operator removed the file after provisioning.
+    if [ ! -f "$config" ]; then
+        sync
+        cleanup_config_mount
+        note "CONFIG.TXT absent during finalization; treating credentials as already scrubbed."
+        return 0
+    fi
+    if ! grep -Eq '^(PSK|ROOT_PASSWORD)=' "$config"; then
+        sync
+        cleanup_config_mount
+        note "CONFIG.TXT contains no credential keys; treating credentials as already scrubbed."
+        return 0
+    fi
 
-    timeout 20s perl - "$DISK" "$PARTNUM" "$TOTAL_SECTORS" <<'PERL'
+    tmp="$CFG_MNT/.CONFIG.TXT.scrub.$$"
+    rc=0
+    if (
+        umask 077
+        awk '
+            /^PSK=/ { print "PSK="; next }
+            /^ROOT_PASSWORD=/ { print "ROOT_PASSWORD="; next }
+            { print }
+        ' "$config" >"$tmp"
+    ); then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"
+        cleanup_config_mount
+        fail "unable to rewrite CONFIG.TXT for credential scrub (awk rc=$rc)."
+    fi
+    sync
+    mv -f "$tmp" "$config" || { rm -f "$tmp"; cleanup_config_mount; fail "unable to replace CONFIG.TXT during credential scrub."; }
+    sync
+    if grep -Eq '^PSK=.+|^ROOT_PASSWORD=.+' "$config"; then
+        cleanup_config_mount
+        fail "credential scrub verification found a nonblank PSK or ROOT_PASSWORD."
+    fi
+    cleanup_config_mount
+    note "CONFIG.TXT credentials scrubbed: PSK and ROOT_PASSWORD are blank or absent."
+}
+
+attempt_root_resize() {
+    local root_dev partnum pkname disk total_sectors root_basename part_start kernel_before expected_sectors
+    local kernel_after before_root after_root attempt
+    [ -e "$RESIZE_MARKER" ] && return 0
+
+    root_dev="$(readlink -f "$(findmnt -n -o SOURCE /)" 2>/dev/null || true)"
+    [ -n "$root_dev" ] || { note "WARNING: resize deferred: unable to determine root device."; return 1; }
+    partnum="$(lsblk -no PARTN "$root_dev" 2>/dev/null | tr -d '[:space:]')"
+    pkname="$(lsblk -no PKNAME "$root_dev" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$partnum" ] && [ -n "$pkname" ] || { note "WARNING: resize deferred: root partition geometry unavailable."; return 1; }
+    disk="/dev/$pkname"
+    total_sectors="$(blockdev --getsz "$disk" 2>/dev/null || true)"
+    root_basename="$(basename "$root_dev")"
+    part_start="$(cat "/sys/class/block/$root_basename/start" 2>/dev/null || true)"
+    kernel_before="$(blockdev --getsz "$root_dev" 2>/dev/null || true)"
+    printf '%s' "$total_sectors" | grep -Eq '^[0-9]+$' || { note "WARNING: resize deferred: invalid disk geometry."; return 1; }
+    printf '%s' "$part_start" | grep -Eq '^[0-9]+$' || { note "WARNING: resize deferred: invalid partition geometry."; return 1; }
+    expected_sectors=$((total_sectors - part_start))
+    [ "$expected_sectors" -gt 0 ] || { note "WARNING: resize deferred: invalid expected root size."; return 1; }
+
+    if ! timeout 20s perl - "$disk" "$partnum" "$total_sectors" <<'PERL'
 use strict;
 use warnings;
 my ($disk, $part, $total) = @ARGV;
@@ -127,462 +161,244 @@ read($fh, my $raw, 8) == 8 or die "read partition: $!\n";
 my ($start, $old) = unpack('VV', $raw);
 my $new = $total - $start;
 die "invalid expanded partition size\n" if $new <= 0 || $new > 0xFFFFFFFF;
-print "Partition start=$start old_size=$old new_size=$new\n";
 if ($new != $old) {
     seek($fh, $off + 12, 0) or die "seek size field: $!\n";
     print $fh pack('V', $new) or die "write size field: $!\n";
 }
 close($fh) or die "close $disk: $!\n";
-open(my $verify, '<', $disk) or die "reopen $disk: $!\n";
-binmode($verify);
-seek($verify, $off + 8, 0) or die "verify seek: $!\n";
-read($verify, my $check, 8) == 8 or die "verify read: $!\n";
-my ($vstart, $vsize) = unpack('VV', $check);
-close($verify);
-die "partition verification failed\n" unless $vstart == $start && $vsize == $new;
-print "Verified partition start=$vstart size=$vsize\n";
 PERL
+    then
+        note "WARNING: root partition expansion failed; provisioning will continue and retry next boot."
+        return 1
+    fi
 
     sync
-    stage "03 UPDATING LIVE ROOT PARTITION SIZE"
-    partx --update --nr "$PARTNUM" "$DISK"
+    if ! timeout --signal=TERM --kill-after=5s 30s partx --update --nr "$partnum" "$disk"; then
+        note "WARNING: kernel partition-table refresh failed; provisioning will continue and retry next boot."
+        return 1
+    fi
     udevadm settle --timeout=5 2>/dev/null || true
-
-    KERNEL_UPDATED=0
-    KERNEL_AFTER=""
+    kernel_after=""
     for attempt in $(seq 1 10); do
-        KERNEL_AFTER="$(blockdev --getsz "$ROOT_DEV" 2>/dev/null || true)"
-        if [ "$KERNEL_AFTER" = "$EXPECTED_SECTORS" ]; then
-            KERNEL_UPDATED=1
-            break
-        fi
+        kernel_after="$(blockdev --getsz "$root_dev" 2>/dev/null || true)"
+        [ "$kernel_after" = "$expected_sectors" ] && break
         sleep 1
     done
-    echo "Kernel sectors after:  ${KERNEL_AFTER:-unknown}"
-    if [ "$KERNEL_UPDATED" -ne 1 ]; then
-        fail "kernel did not expose expanded partition size (expected $EXPECTED_SECTORS, observed ${KERNEL_AFTER:-unknown})."
+    if [ "$kernel_after" != "$expected_sectors" ]; then
+        note "WARNING: expanded partition is not visible yet; provisioning will continue and retry next boot."
+        return 1
     fi
 
-    stage "04 GROWING ROOT FILESYSTEM ONLINE"
-    BEFORE_ROOT="$(df -h / | awk 'NR==2 {print $2}')"
-    echo "Before:"
-    df -h /
-    if ! resize2fs "$ROOT_DEV"; then
-        echo "This image does not attempt filesystem repair on the target."
-        fail "online root filesystem expansion failed."
+    before_root="$(df -h / | awk 'NR==2 {print $2}')"
+    if ! timeout --signal=TERM --kill-after=10s 180s resize2fs "$root_dev"; then
+        note "WARNING: online resize2fs failed; Wi-Fi/SSH provisioning will continue and resize will retry next boot."
+        return 1
     fi
-    echo "After:"
-    df -h /
-    AFTER_ROOT="$(df -h / | awk 'NR==2 {print $2}')"
+    after_root="$(df -h / | awk 'NR==2 {print $2}')"
     touch "$RESIZE_MARKER"
     sync
-    note "Root filesystem: ${BEFORE_ROOT:-unknown} -> ${AFTER_ROOT:-unknown}"
-fi
+    note "Root filesystem: ${before_root:-unknown} -> ${after_root:-unknown}"
+    return 0
+}
 
-# ---------------------------------------------------------------------------
-# Stable appliance identity. If a prior attempt already wrote a valid random
-# hostname, reuse it even if the identity checkpoint itself was not reached.
-# ---------------------------------------------------------------------------
-stage "05 DEVICE IDENTITY + ACCOUNTS"
-systemd-machine-id-setup
-MACHINE_ID="$(cat /etc/machine-id)"
-note "Machine ID: $MACHINE_ID"
-
-CURRENT_HOST="$(cat /etc/hostname 2>/dev/null | tr -d '[:space:]' || true)"
-if printf '%s' "$CURRENT_HOST" | grep -Eq '^bpi-zero-wbuild-[0-9a-z]{3}$'; then
-    HOSTNAME_NEW="$CURRENT_HOST"
-else
-    HOST_ALPHABET='0123456789abcdefghijklmnopqrstuvwxyz'
-    HOST_RANDOM="$(od -An -N2 -tu2 /dev/urandom | tr -d '[:space:]')"
-    HOST_RANDOM=$((HOST_RANDOM % 46656))
-    HOST_SUFFIX="${HOST_ALPHABET:$((HOST_RANDOM / 1296)):1}${HOST_ALPHABET:$(((HOST_RANDOM / 36) % 36)):1}${HOST_ALPHABET:$((HOST_RANDOM % 36)):1}"
-    HOSTNAME_NEW="bpi-zero-wbuild-$HOST_SUFFIX"
-    printf '%s\n' "$HOSTNAME_NEW" >/etc/hostname
-    sync
-fi
-
-hostnamectl set-hostname "$HOSTNAME_NEW" || true
-if grep -qE '^127\.0\.1\.1[[:space:]]+' /etc/hosts; then
-    sed -i -E "s/^127\.0\.1\.1[[:space:]]+.*/127.0.1.1\t$HOSTNAME_NEW/" /etc/hosts
-else
-    printf '127.0.1.1\t%s\n' "$HOSTNAME_NEW" >>/etc/hosts
-fi
-
-if [ ! -e "$IDENTITY_MARKER" ]; then
-    echo 'root:bpi-zero-wbuild' | chpasswd
-    if ! id bpi-zero-wbuild >/dev/null 2>&1; then
-        useradd -m -s /bin/bash bpi-zero-wbuild
-    fi
-    echo 'bpi-zero-wbuild:bpi-zero-wbuild' | chpasswd
-    touch "$IDENTITY_MARKER"
-    sync
-else
-    echo "Identity/account checkpoint reused."
-fi
-note "Hostname: $HOSTNAME_NEW"
-timedatectl set-ntp true || true
-
-stage "06 SSH HOST KEYS"
-if [ -e "$SSH_MARKER" ]; then
-    note "SSH host-key checkpoint reused."
-else
-    ssh-keygen -A
-    touch "$SSH_MARKER"
-    sync
-    note "SSH host keys ready."
-fi
-
-stage "07 RUNTIME USERSPACE + CLI TOOLS"
-PACKAGES=(
-  /root/readline-common_8.2-6_all.deb
-  /root/libreadline8t64_8.2-6_armhf.deb
-  /root/libell0_0.77-1_armhf.deb
-  /root/wireless-regdb_2026.05.30-1~deb13u1_all.deb
-  /root/iwd_3.8-2_armhf.deb
-  /root/libelf1t64_0.192-4_armhf.deb
-  /root/libbpf1_1.5.0-3_armhf.deb
-  /root/libmnl0_1.0.5-3_armhf.deb
-  /root/libdb5.3t64_5.3.28+dfsg2-9_armhf.deb
-  /root/libtirpc-common_1.3.6+ds-1_all.deb
-  /root/libtirpc3t64_1.3.6+ds-1_armhf.deb
-  /root/libxtables12_1.8.11-2_armhf.deb
-  /root/libcap2-bin_2.75-10+deb13u1+b1_armhf.deb
-  /root/iproute2_6.15.0-1_armhf.deb
-  /root/libnl-3-200_3.7.0-2_armhf.deb
-  /root/libnl-genl-3-200_3.7.0-2_armhf.deb
-  /root/iw_6.9-1_armhf.deb
-  /root/libasound2-data_1.2.14-1_all.deb
-  /root/libasound2t64_1.2.14-1_armhf.deb
-  /root/libatopology2t64_1.2.14-1_armhf.deb
-  /root/gcc-14-base_14.2.0-19_armhf.deb
-  /root/libgomp1_14.2.0-19_armhf.deb
-  /root/libfftw3-single3_3.3.10-2+b1_armhf.deb
-  /root/libtinfo6_6.5+20250216-2_armhf.deb
-  /root/libncursesw6_6.5+20250216-2_armhf.deb
-  /root/libsamplerate0_0.2.2-4+b2_armhf.deb
-  /root/alsa-utils_1.2.14-1_armhf.deb
-)
-cleanup_staged_packages() {
+cleanup_packages() {
     rm -f "${PACKAGES[@]}" || note "WARNING: unable to remove all staged package archives."
 }
-if [ -e "$PACKAGES_MARKER" ]; then
-    cleanup_staged_packages
-    note "Package checkpoint reused (iwd + iproute2 + iw + alsa-utils); staged package cleanup verified."
-else
-    for package in "${PACKAGES[@]}"; do
-        [ -f "$package" ] || fail "package missing: $package"
-    done
-    : >"$PKG_LOG"
-    # Networking userspace is installed before Wi-Fi exists, so these bootstrap
-    # dpkg calls must be noninteractive themselves. Stage 14 later makes the
-    # same headless policy persistent for future package administration.
-    if ! DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
-            dpkg --unpack "${PACKAGES[@]}" >>"$PKG_LOG" 2>&1; then
-        echo "Package unpack failed; last 80 lines from $PKG_LOG:"
-        tail -80 "$PKG_LOG" || true
-        fail "runtime package unpack failed."
-    fi
-    if ! DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
-            dpkg --configure -a >>"$PKG_LOG" 2>&1; then
-        echo "Package configuration failed; last 80 lines from $PKG_LOG:"
-        tail -80 "$PKG_LOG" || true
-        fail "runtime package configuration failed."
-    fi
-    # alsa-utils is diagnostic-only; appliance audio state is application-owned.
-    systemctl mask alsa-restore.service alsa-state.service alsa-utils.service >>"$PKG_LOG" 2>&1
-    # Commit the successful package state before removing the offline payload.
-    # A power loss during cleanup therefore cannot strand firstboot without .debs.
-    touch "$PACKAGES_MARKER"
+
+finish_provisioning() {
+    local ip mac
+    # Keep headless recovery available even if a later finalization step fails.
+    start_ssh
+    cleanup_packages
+    scrub_config_secrets
+    ip="$(ipv4_for_wlan0)"
+    mac="$(cat /sys/class/net/wlan0/address 2>/dev/null || true)"
+    mkdir -p /etc/issue.d
+    printf 'Wi-Fi: wlan0  MAC: %s  IPv4: \\4{wlan0}\n' "${mac:-unavailable}" \
+        >/etc/issue.d/90-bpi-zero-network.issue
+    touch "$MARKER"
+    rm -f "$READY_MARKER"
+    write_status complete connected "${ip:-NONE}"
     sync
-    cleanup_staged_packages
-    sync
-    note "iwd + regulatory support + iproute2 + iw + alsa-utils ready; staged packages removed."
-    echo "Detailed dpkg output: $PKG_LOG"
+    if [ -e "$RESIZE_MARKER" ]; then
+        systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
+            fail "provisioning complete but unable to disable firstboot service."
+    else
+        note "Root resize remains deferred; firstboot will retry it on the next boot."
+    fi
+    printf 'Wi-Fi: wlan0  MAC: %s  IPv4: %s\n' "${mac:-unavailable}" "${ip:-NONE}" \
+        >/dev/tty1 2>/dev/null || true
+    note "Provisioning complete."
+}
+
+write_status running pending NONE
+stage "01 FIRSTBOOT"
+date -Is 2>/dev/null || date
+
+# Completed provisioning only returns here to retry a deferred root resize.
+if [ -e "$MARKER" ]; then
+    if [ ! -e "$RESIZE_MARKER" ]; then
+        stage "02 RETRY ROOT RESIZE"
+        attempt_root_resize || { note "Root resize remains deferred."; exit 0; }
+    fi
+    systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
+        fail "unable to disable completed firstboot service."
+    exit 0
 fi
 
-stage "08 READING BPIWBUILD CONFIG"
-modprobe vfat 2>/dev/null || true
-CFG_MNT=/mnt/bpi-zero-wbuild-config
-CFG_MOUNTED=0
-mkdir -p "$CFG_MNT"
-cleanup_config_mount() {
-    if [ "$CFG_MOUNTED" -eq 1 ]; then
-        umount "$CFG_MNT" 2>/dev/null || true
-        CFG_MOUNTED=0
-    fi
-}
-trap cleanup_config_mount EXIT
-CFG_DEV=""
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    CFG_DEV="$(blkid -L BPIWBUILD 2>/dev/null || true)"
-    [ -n "$CFG_DEV" ] && break
-    udevadm settle --timeout=2 2>/dev/null || true
-    sleep 1
-done
-[ -n "$CFG_DEV" ] || fail "could not find a partition labeled BPIWBUILD."
-mount -t vfat -o ro "$CFG_DEV" "$CFG_MNT"
-CFG_MOUNTED=1
+# All substantive provisioning completed before the previous boot stopped.
+if [ -e "$READY_MARKER" ]; then
+    stage "02 FINALIZE INTERRUPTED FIRSTBOOT"
+    finish_provisioning
+    exit 0
+fi
+
+stage "02 ROOT FILESYSTEM CAPACITY"
+# Storage preparation is independent of credentials. Always attempt it before
+# validating CONFIG.TXT so a configuration mistake cannot leave the card at
+# the seed-image size. Failure remains non-fatal and is retried on later boots.
+attempt_root_resize || true
+
+stage "03 CONFIG + ROOT LOGIN"
+mount_config ro
 CONFIG="$CFG_MNT/CONFIG.TXT"
 [ -f "$CONFIG" ] || fail "CONFIG.TXT not found on BPIWBUILD partition."
-config_value() {
-    local key="$1"
-    grep -E "^${key}=" "$CONFIG" 2>/dev/null | tail -n1 | cut -d= -f2- || true
-}
-SSID="$(config_value SSID)"
-PSK="$(config_value PSK)"
-COUNTRY="$(config_value COUNTRY)"
-HIDDEN="$(config_value HIDDEN)"
-TIMEZONE="$(config_value TIMEZONE)"
+config_value() { grep -E "^${1}=" "$CONFIG" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+SSID="$(config_value SSID | tr -d '\r')"
+PSK="$(config_value PSK | tr -d '\r')"
+COUNTRY="$(config_value COUNTRY | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+HIDDEN="$(config_value HIDDEN | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+TIMEZONE="$(config_value TIMEZONE | tr -d '\r')"
+ROOT_PASSWORD="$(config_value ROOT_PASSWORD | tr -d '\r')"
 cleanup_config_mount
-trap - EXIT
-trim() { printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-SSID="$(trim "$SSID")"
-PSK="$(trim "$PSK")"
-COUNTRY="$(trim "$COUNTRY" | tr '[:lower:]' '[:upper:]')"
-HIDDEN="$(trim "$HIDDEN" | tr '[:upper:]' '[:lower:]')"
-TIMEZONE="$(trim "$TIMEZONE")"
-[ -n "$SSID" ] || fail "SSID is empty in CONFIG.TXT."
-PSK_LEN=${#PSK}
-[ "$PSK_LEN" -ge 8 ] && [ "$PSK_LEN" -le 63 ] || fail "PSK must be 8-63 characters (got $PSK_LEN)."
-printf '%s' "$COUNTRY" | grep -Eq '^[A-Z]{2}$' || fail "COUNTRY must be a two-letter code such as CA, got '$COUNTRY'."
-case "$HIDDEN" in true|false) ;; *) HIDDEN="false" ;; esac
-[ -n "$TIMEZONE" ] || TIMEZONE="America/Edmonton"
-note "Config: SSID='$SSID' country=$COUNTRY hidden=$HIDDEN timezone=$TIMEZONE"
 
-stage "09 TIME ZONE"
+ROOT_PASSWORD_LEN=${#ROOT_PASSWORD}
+[ "$ROOT_PASSWORD_LEN" -ge 8 ] && [ "$ROOT_PASSWORD_LEN" -le 64 ] || \
+    fail "ROOT_PASSWORD must be 8-64 characters (got $ROOT_PASSWORD_LEN)."
+printf '%s' "$ROOT_PASSWORD" | grep -q ':' && fail "ROOT_PASSWORD cannot contain a colon."
+printf 'root:%s\n' "$ROOT_PASSWORD" | chpasswd || fail "unable to set root password."
+unset ROOT_PASSWORD ROOT_PASSWORD_LEN
+ROOT_HASH="$(awk -F: '$1 == "root" {print $2}' /etc/shadow)"
+case "$ROOT_HASH" in ''|'!'*|'*'*) fail "root account remained locked after password update." ;; esac
+unset ROOT_HASH
+
+SSID="$(printf '%s' "$SSID" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+COUNTRY="$(printf '%s' "$COUNTRY" | tr -d '[:space:]')"
+HIDDEN="$(printf '%s' "$HIDDEN" | tr -d '[:space:]')"
+TIMEZONE="$(printf '%s' "$TIMEZONE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+[ -n "$SSID" ] || fail "SSID is empty in CONFIG.TXT."
+[ ${#PSK} -ge 8 ] && [ ${#PSK} -le 63 ] || fail "PSK must be 8-63 characters."
+printf '%s' "$COUNTRY" | grep -Eq '^[A-Z]{2}$' || fail "COUNTRY must be a two-letter code such as CA."
+case "$HIDDEN" in true|false) ;; *) HIDDEN=false ;; esac
+[ -n "$TIMEZONE" ] || TIMEZONE=America/Edmonton
+
+mkdir -p /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/20-bpi-zero-root.conf <<'EOF_SSH'
+PermitRootLogin yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+
+Match User root
+    PasswordAuthentication yes
+EOF_SSH
+chmod 600 /etc/ssh/sshd_config.d/20-bpi-zero-root.conf
+ssh-keygen -A || fail "unable to generate SSH host keys."
+sshd -t || fail "generated SSH configuration is invalid."
+systemctl enable ssh.service >/dev/null 2>&1 || fail "unable to enable SSH."
+
+stage "04 DEVICE IDENTITY + TIME"
+systemd-machine-id-setup
+MACHINE_ID="$(tr -d '[:space:]' </etc/machine-id)"
+[ ${#MACHINE_ID} -ge 6 ] || fail "machine-id generation failed."
+CURRENT_HOST="bpi-zero-${MACHINE_ID:0:6}"
+printf '%s\n' "$CURRENT_HOST" >/etc/hostname
+hostnamectl set-hostname "$CURRENT_HOST" || true
+if grep -qE '^127\.0\.1\.1[[:space:]]+' /etc/hosts; then
+    sed -i -E "s/^127\.0\.1\.1[[:space:]]+.*/127.0.1.1\t$CURRENT_HOST/" /etc/hosts
+else
+    printf '127.0.1.1\t%s\n' "$CURRENT_HOST" >>/etc/hosts
+fi
 if timedatectl list-timezones 2>/dev/null | grep -qxF "$TIMEZONE"; then
     timedatectl set-timezone "$TIMEZONE" || true
 else
-    echo "WARNING: invalid timezone '$TIMEZONE'; using America/Edmonton."
-    timedatectl set-timezone "America/Edmonton" || true
+    timedatectl set-timezone America/Edmonton || true
 fi
-note "Timezone: $(timedatectl show -p Timezone --value 2>/dev/null || echo "$TIMEZONE")"
+timedatectl set-ntp true || true
 
-stage "10 CONFIGURING WIFI + DHCP"
+stage "05 INSTALL WIFI USERSPACE"
+for package in "${PACKAGES[@]}"; do [ -f "$package" ] || fail "package missing: $package"; done
+for reg in /usr/lib/firmware/regulatory.db /usr/lib/firmware/regulatory.db.p7s; do
+    [ ! -e "$reg" ] || [ -L "$reg" ] || rm -f "$reg"
+done
+: >"$PKG_LOG"
+timeout --signal=TERM --kill-after=10s 300s env DEBIAN_FRONTEND=noninteractive \
+    DEBCONF_NONINTERACTIVE_SEEN=true dpkg --unpack "${PACKAGES[@]}" >>"$PKG_LOG" 2>&1 || {
+    tail -80 "$PKG_LOG" || true; fail "runtime package unpack failed."; }
+timeout --signal=TERM --kill-after=10s 300s env DEBIAN_FRONTEND=noninteractive \
+    DEBCONF_NONINTERACTIVE_SEEN=true dpkg --configure -a >>"$PKG_LOG" 2>&1 || {
+    tail -80 "$PKG_LOG" || true; fail "runtime package configuration failed."; }
+
+stage "06 WIFI + DHCP"
 mkdir -p /etc/iwd /var/lib/iwd /etc/systemd/network
-cat >/etc/iwd/main.conf <<EOF2
-[General]
-Country=$COUNTRY
-
-[DriverQuirks]
-PowerSaveDisable=brcmfmac
-EOF2
-note "Wi-Fi power-save policy: OFF for brcmfmac (persistent via iwd DriverQuirks)."
+printf '[General]\nCountry=%s\n' "$COUNTRY" >/etc/iwd/main.conf
 if printf '%s' "$SSID" | grep -Eq '^[A-Za-z0-9 _-]+$'; then
     IWD_NAME="${SSID}.psk"
 else
-    IWD_HEX="$(printf '%s' "$SSID" | od -An -tx1 | tr -d ' \n')"
-    IWD_NAME="=${IWD_HEX}.psk"
+    IWD_NAME="=$(printf '%s' "$SSID" | od -An -tx1 | tr -d ' \n').psk"
 fi
 PROFILE="/var/lib/iwd/$IWD_NAME"
-# If a prior failed firstboot used a different SSID, remove only the profile
-# that firstboot itself recorded as owned. Never sweep unrelated iwd profiles.
-if [ -f "$IWD_PROFILE_STATE" ]; then
-    OLD_IWD_NAME="$(tr -d '\r\n' <"$IWD_PROFILE_STATE")"
-    case "$OLD_IWD_NAME" in
-        ''|.|..|*/*) ;;
-        *)
-            if [ "$OLD_IWD_NAME" != "$IWD_NAME" ]; then
-                rm -f "/var/lib/iwd/$OLD_IWD_NAME"
-                note "Removed stale firstboot Wi-Fi profile '$OLD_IWD_NAME'."
-            fi
-            ;;
-    esac
-fi
+install -m 0600 /dev/null "$PROFILE"
+IWD_PSK="${PSK//\\/\\\\}"
 {
     echo '[Security]'
-    printf 'Passphrase=%s\n' "$PSK"
+    printf 'Passphrase=%s\n' "$IWD_PSK"
     echo
     echo '[Settings]'
     echo 'AutoConnect=true'
     printf 'Hidden=%s\n' "$HIDDEN"
 } >"$PROFILE"
-chmod 600 "$PROFILE"
-printf '%s\n' "$IWD_NAME" >"$IWD_PROFILE_STATE"
-cat >/etc/systemd/network/25-wlan0.network <<'EOF2'
+cat >/etc/systemd/network/25-wlan0.network <<'EOF_NET'
 [Match]
 Name=wlan0
 
 [Network]
 DHCP=ipv4
 IPv6AcceptRA=no
-EOF2
-systemctl daemon-reload
-systemctl enable iwd.service systemd-networkd.service ssh.service >/dev/null
-systemctl restart iwd.service
-systemctl restart systemd-networkd.service
-systemctl restart systemd-resolved.service || true
-note "Wi-Fi services started; waiting for '$SSID'."
+EOF_NET
+systemctl enable iwd.service systemd-networkd.service systemd-resolved.service >/dev/null
+systemctl restart systemd-resolved.service || fail "unable to start systemd-resolved."
+systemctl restart iwd.service || fail "unable to start iwd."
+systemctl restart systemd-networkd.service || fail "unable to start systemd-networkd."
+[ -e /run/systemd/resolve/stub-resolv.conf ] || fail "systemd-resolved did not provide stub-resolv.conf."
+ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
-has_ipv4() {
-    ip -4 -o addr show dev wlan0 scope global 2>/dev/null | grep -q 'inet '
-}
-
-show_ipv4() {
-    ip -4 -br addr show wlan0 || true
-    ip -4 route show default || true
-}
-
-wifi_power_save_state() {
-    local state=""
-    state="$(iw dev wlan0 get power_save 2>/dev/null || true)"
-    if printf '%s' "$state" | grep -qi 'power save: off'; then
-        printf '%s\n' "OFF"
-    elif printf '%s' "$state" | grep -qi 'power save: on'; then
-        printf '%s\n' "ON"
-    elif [ -n "$state" ]; then
-        printf '%s\n' "$state"
-    else
-        printf '%s\n' "UNKNOWN"
-    fi
-}
-
-report_wifi_power_save() {
-    local state
-    state="$(wifi_power_save_state)"
-    if [ "$state" = "OFF" ]; then
-        note "Wi-Fi power save effective: OFF"
-    else
-        echo "WARNING: effective Wi-Fi power-save state is not OFF: $state"
-        console_line "  WARNING: Wi-Fi power-save verification returned: $state"
-    fi
-}
-
-ssid_visible_now() {
-    local scan line found=1
-    scan="$(timeout 12s iw dev wlan0 scan 2>/dev/null || true)"
-    [ -n "$scan" ] || return 2
-    while IFS= read -r line; do
-        line="${line#${line%%[![:space:]]*}}"
-        case "$line" in
-            SSID:*)
-                if [ "${line#SSID: }" = "$SSID" ] || [ "${line#SSID:}" = "$SSID" ]; then
-                    found=0
-                    break
-                fi
-                ;;
-        esac
-    done <<<"$scan"
-    return "$found"
-}
-
-wifi_diag_snapshot() {
-    local label="$1" driver="unknown" mac="unknown" link="" associated="NO"
-    local bssid="-" signal="-" visible="UNKNOWN" power ipv4="NONE"
-
-    if [ -e /sys/class/net/wlan0/device/driver ]; then
-        driver="$(basename "$(readlink -f /sys/class/net/wlan0/device/driver)" 2>/dev/null || echo unknown)"
-    fi
-    [ -r /sys/class/net/wlan0/address ] && mac="$(cat /sys/class/net/wlan0/address)"
-
-    link="$(iw dev wlan0 link 2>/dev/null || true)"
-    if printf '%s\n' "$link" | grep -q '^Connected to '; then
-        associated="YES"
-        bssid="$(printf '%s\n' "$link" | awk '/^Connected to / {print $3; exit}')"
-        signal="$(printf '%s\n' "$link" | awk '/^[[:space:]]*signal:/ {print $2 " " $3; exit}')"
-        visible="YES"
-    else
-        if ssid_visible_now; then
-            visible="YES"
-        else
-            case $? in
-                1) visible="NO" ;;
-                *) visible="UNKNOWN" ;;
-            esac
-        fi
-    fi
-
-    power="$(wifi_power_save_state)"
-    ipv4="$(ip -4 -o addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
-    [ -n "$ipv4" ] || ipv4="NONE"
-
-    echo "Wi-Fi state ($label):"
-    echo "  Interface:       wlan0"
-    echo "  Driver:          $driver"
-    echo "  MAC:             $mac"
-    echo "  SSID configured: $SSID"
-    echo "  SSID visible:    $visible"
-    echo "  Associated:      $associated"
-    [ "$associated" = "YES" ] && echo "  BSSID:           $bssid"
-    [ "$associated" = "YES" ] && echo "  Signal:          $signal"
-    echo "  Power save:      $power"
-    echo "  IPv4:            $ipv4"
-
-    console_line "  Wi-Fi: visible=$visible associated=$associated power_save=$power ipv4=$ipv4"
-}
-
-wait_ipv4() {
-    local seconds="$1"
-    local attempt
-    for attempt in $(seq 1 "$seconds"); do
-        if has_ipv4; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-stage "11 VERIFYING WIFI + IPV4 (ATTEMPT 1/2)"
-DHCP_OK=0
-if wait_ipv4 60; then
-    DHCP_OK=1
-    wifi_diag_snapshot "attempt 1 success"
-else
-    wifi_diag_snapshot "attempt 1 failed"
-    stage "12 WIFI RECOVERY RETRY"
-    note "No IPv4 after 60 seconds; restarting radio/userspace once."
-    systemctl stop iwd.service || true
-    modprobe -r brcmfmac 2>/dev/null || true
-    modprobe -r brcmutil 2>/dev/null || true
-    modprobe brcmfmac || true
-    sleep 2
-    systemctl restart systemd-networkd.service || true
-    systemctl restart iwd.service || true
-    systemctl restart systemd-resolved.service || true
-    stage "13 VERIFYING WIFI + IPV4 (ATTEMPT 2/2)"
-    if wait_ipv4 60; then
-        DHCP_OK=1
-        wifi_diag_snapshot "attempt 2 success"
-    else
-        wifi_diag_snapshot "attempt 2 failed"
-    fi
+IPV4_ADDR=""
+for _ in $(seq 1 90); do
+    IPV4_ADDR="$(ipv4_for_wlan0)"
+    [ -n "$IPV4_ADDR" ] && break
+    sleep 1
+done
+if [ -z "$IPV4_ADDR" ]; then
+    SYSTEMD_COLORS=0 networkctl status wlan0 --no-pager || true
+    iwctl station wlan0 show || true
+    journalctl -b -u iwd --no-pager -n 80 || true
+    dmesg | grep -Ei 'brcmfmac|brcm|firmware|mmc|sdio' | tail -n 120 || true
+    fail "wlan0 did not receive an IPv4 DHCP address within 90 seconds."
 fi
+WIFI_MAC="$(cat /sys/class/net/wlan0/address 2>/dev/null || true)"
+[ -n "$WIFI_MAC" ] || fail "wlan0 MAC address is unavailable."
+write_status running connected "$IPV4_ADDR"
+note "Wi-Fi: wlan0  MAC: $WIFI_MAC  IPv4: $IPV4_ADDR"
 
-if [ "$DHCP_OK" -ne 1 ]; then
-    write_status failed failed NONE
-    echo "ERROR: wlan0 did not receive an IPv4 DHCP address after two attempts."
-    echo "Useful diagnostics:"
-    echo "  ip -br addr"
-    echo "  ip route"
-    echo "  networkctl status wlan0 --no-pager"
-    echo "  journalctl -b -u iwd --no-pager"
-    echo "  journalctl -b -u systemd-networkd --no-pager"
-    echo "  dmesg | grep -Ei 'brcmfmac|firmware|mmc|sdio'"
-    console_line "  Wi-Fi failed after one automatic recovery retry; see $LOG"
-    exit 1
-fi
+# DHCP is confirmed. Bring up remote administration before credential scrub or
+# any other finalization work so a non-network finalization fault cannot leave
+# an otherwise reachable headless board without SSH.
+start_ssh
+note "SSH ready: $IPV4_ADDR"
 
-show_ipv4
-report_wifi_power_save
-IPV4_ADDR="$(ip -4 -o addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)"
-write_status running connected "${IPV4_ADDR:-NONE}"
-note "IPv4 ready: ${IPV4_ADDR:-configured}"
-systemctl restart ssh.service || true
-
-stage "14 PERSISTENT HEADLESS DEBCONF"
+stage "07 FINALIZE"
 printf '%s\n' 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
-note "Debconf frontend: Noninteractive (persistent)"
-
-stage "15 FIRSTBOOT COMPLETE"
-# Commit completion before disabling this service. If power is lost after the
-# marker but before disable finishes, the marker branch retries the disable.
-touch "$MARKER"
-write_status complete connected "${IPV4_ADDR:-NONE}"
+touch "$READY_MARKER"
 sync
-systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
-    fail "provisioning complete but unable to disable firstboot service."
-cleanup_completed_state
-note "Provisioning complete: storage, identity, Wi-Fi, DHCP, SSH, headless package configuration and network diagnostics ready."
-note "No reboot required."
+finish_provisioning
 exit 0
