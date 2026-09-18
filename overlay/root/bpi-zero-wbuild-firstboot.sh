@@ -8,7 +8,6 @@ READY_MARKER=/var/lib/bpi-zero-wbuild-ready-to-finalize.done
 RESIZE_MARKER=/var/lib/bpi-zero-wbuild-resize.done
 CFG_MNT=/mnt/bpi-zero-wbuild-config
 CFG_DEV=/dev/disk/by-label/BPIWBUILD
-WIFI_IF=wlan0
 PACKAGES=(
   /root/readline-common_8.2-6_all.deb
   /root/libreadline8t64_8.2-6_armhf.deb
@@ -37,20 +36,35 @@ fail() {
 
 ipv4_for_wlan0() {
     SYSTEMD_COLORS=0 networkctl status wlan0 --no-pager 2>/dev/null | awk '
-        /Address:/ {
-            for (i=2; i<=NF; i++) {
+        /^[[:space:]]*[[:alpha:]][[:alnum:] .()_\/-]*:([[:space:]]+|$)/ { inblock=0 }
+        /^[[:space:]]*Address:([[:space:]]+|$)/ { inblock=1 }
+        inblock {
+            for (i=1; i<=NF; i++) {
                 candidate=$i
                 sub(/\/[0-9]+$/, "", candidate)
-                if (candidate ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                if (candidate ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && candidate !~ /^169\.254\./) {
                     print candidate; exit
                 }
             }
         }' || true
 }
 
-start_ssh() {
+start_ssh_best_effort() {
     systemctl is-active --quiet ssh.service 2>/dev/null && return 0
-    systemctl start ssh.service || fail "unable to start SSH."
+    if ! systemctl start ssh.service; then
+        note "WARNING: SSH did not start yet; it will be required after DHCP succeeds."
+        return 1
+    fi
+    if ! systemctl is-active --quiet ssh.service; then
+        note "WARNING: SSH start returned but service is not active yet; it will be required after DHCP succeeds."
+        return 1
+    fi
+    return 0
+}
+
+require_ssh() {
+    systemctl is-active --quiet ssh.service 2>/dev/null || \
+        systemctl start ssh.service || fail "unable to start SSH."
     systemctl is-active --quiet ssh.service || fail "SSH did not become active."
 }
 
@@ -207,8 +221,9 @@ cleanup_packages() {
 
 finish_provisioning() {
     local ip mac
-    # Keep headless recovery available even if a later finalization step fails.
-    start_ssh
+    # SSH was required after DHCP. A transient restart failure here must not
+    # block credential scrub, completion markers or firstboot disable.
+    start_ssh_best_effort || true
     cleanup_packages
     scrub_config_secrets
     ip="$(ipv4_for_wlan0)"
@@ -238,7 +253,7 @@ date -Is 2>/dev/null || date
 # Completed provisioning only returns here to retry a deferred root resize.
 if [ -e "$MARKER" ]; then
     if [ ! -e "$RESIZE_MARKER" ]; then
-        stage "02 RETRY ROOT RESIZE"
+        stage "90 RECOVERY: RETRY ROOT RESIZE"
         attempt_root_resize || { note "Root resize remains deferred."; exit 0; }
     fi
     systemctl disable bpi-zero-wbuild-firstboot.service >/dev/null 2>&1 || \
@@ -248,7 +263,7 @@ fi
 
 # All substantive provisioning completed before the previous boot stopped.
 if [ -e "$READY_MARKER" ]; then
-    stage "02 FINALIZE INTERRUPTED FIRSTBOOT"
+    stage "91 RECOVERY: FINALIZE INTERRUPTED FIRSTBOOT"
     finish_provisioning
     exit 0
 fi
@@ -295,16 +310,30 @@ case "$HIDDEN" in true|false) ;; *) HIDDEN=false ;; esac
 mkdir -p /etc/ssh/sshd_config.d
 cat >/etc/ssh/sshd_config.d/20-bpi-zero-root.conf <<'EOF_SSH'
 PermitRootLogin yes
-PasswordAuthentication no
+PasswordAuthentication yes
 KbdInteractiveAuthentication no
-
-Match User root
-    PasswordAuthentication yes
+PubkeyAuthentication yes
 EOF_SSH
 chmod 600 /etc/ssh/sshd_config.d/20-bpi-zero-root.conf
+install -d -m 0755 /run/sshd
 ssh-keygen -A || fail "unable to generate SSH host keys."
 sshd -t || fail "generated SSH configuration is invalid."
+SSH_EFFECTIVE="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)" || \
+    fail "unable to evaluate effective SSH policy."
+SSH_ROOT_LOGIN="$(printf '%s\n' "$SSH_EFFECTIVE" | awk '$1=="permitrootlogin" {print $2; exit}')"
+SSH_PASSWORD_AUTH="$(printf '%s\n' "$SSH_EFFECTIVE" | awk '$1=="passwordauthentication" {print $2; exit}')"
+[ "$SSH_ROOT_LOGIN" = yes ] || fail "effective SSH policy does not permit root login (permitrootlogin=${SSH_ROOT_LOGIN:-unknown})."
+[ "$SSH_PASSWORD_AUTH" = yes ] || fail "effective SSH policy does not permit password authentication for root (passwordauthentication=${SSH_PASSWORD_AUTH:-unknown})."
+note "SSH policy verified: root login=yes password authentication=yes."
+unset SSH_EFFECTIVE SSH_ROOT_LOGIN SSH_PASSWORD_AUTH
 systemctl enable ssh.service >/dev/null 2>&1 || fail "unable to enable SSH."
+
+# SSH has no dependency on Wi-Fi. Try it now so it can already be listening
+# when wlan0 later acquires an address. This attempt is deliberately non-fatal;
+# SSH becomes a hard requirement only after DHCP succeeds.
+if start_ssh_best_effort; then
+    note "SSH service active; waiting for network address."
+fi
 
 stage "04 DEVICE IDENTITY + TIME"
 systemd-machine-id-setup
@@ -339,6 +368,10 @@ timeout --signal=TERM --kill-after=10s 300s env DEBIAN_FRONTEND=noninteractive \
     tail -80 "$PKG_LOG" || true; fail "runtime package configuration failed."; }
 
 stage "06 WIFI + DHCP"
+if [ ! -e /sys/class/net/wlan0 ]; then
+    dmesg | grep -Ei 'brcmfmac|brcm|firmware|mmc|sdio' | tail -n 120 || true
+    fail "wlan0 is not present; check BCM43430 firmware and SDIO initialization."
+fi
 mkdir -p /etc/iwd /var/lib/iwd /etc/systemd/network
 printf '[General]\nCountry=%s\n' "$COUNTRY" >/etc/iwd/main.conf
 if printf '%s' "$SSID" | grep -Eq '^[A-Za-z0-9 _-]+$'; then
@@ -382,6 +415,7 @@ if [ -z "$IPV4_ADDR" ]; then
     SYSTEMD_COLORS=0 networkctl status wlan0 --no-pager || true
     iwctl station wlan0 show || true
     journalctl -b -u iwd --no-pager -n 80 || true
+    journalctl -b -u systemd-networkd --no-pager -n 80 || true
     dmesg | grep -Ei 'brcmfmac|brcm|firmware|mmc|sdio' | tail -n 120 || true
     fail "wlan0 did not receive an IPv4 DHCP address within 90 seconds."
 fi
@@ -393,8 +427,8 @@ note "Wi-Fi: wlan0  MAC: $WIFI_MAC  IPv4: $IPV4_ADDR"
 # DHCP is confirmed. Bring up remote administration before credential scrub or
 # any other finalization work so a non-network finalization fault cannot leave
 # an otherwise reachable headless board without SSH.
-start_ssh
-note "SSH ready: $IPV4_ADDR"
+require_ssh
+note "SSH reachable at: $IPV4_ADDR"
 
 stage "07 FINALIZE"
 printf '%s\n' 'debconf debconf/frontend select Noninteractive' | debconf-set-selections

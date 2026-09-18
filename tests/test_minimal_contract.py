@@ -1,5 +1,5 @@
 from pathlib import Path
-import subprocess, struct, tempfile, sys
+import subprocess, struct, tempfile, sys, re
 
 root=Path(__file__).resolve().parents[1]
 build=(root/'build.sh').read_text()
@@ -66,16 +66,17 @@ assert 'CONFIG_SECRET_POLICY=PSK-and-ROOT_PASSWORD-blanked-after-successful-firs
 assert 'install -m 0600 /dev/null "$PROFILE"' in first
 assert 'AutoConnect=true' in first
 assert 'mask_competing_wifi_managers' not in first
-assert 'WIFI_IF=wlan0' in first
+assert 'WIFI_IF=wlan0' not in first
 assert 'cat >/etc/systemd/network/25-wlan0.network' in first
 assert 'Name=wlan0' in first
 assert 'Driver=brcmfmac' not in first
 assert 'detect_wifi_if()' not in first and 'wait_wifi_if()' not in first
-assert 'expected BPI-M2 Zero Wi-Fi interface wlan0 is missing.' not in first
+assert 'wlan0 is not present; check BCM43430 firmware and SDIO initialization.' in first
 assert 'networkctl status wlan0 --no-pager' in first
-assert 'candidate=$i' in first
-assert 'sub(/\\/[0-9]+$/, "", candidate)' in first
-assert 'candidate ~ /^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/' in first
+assert '/^[[:space:]]*Address:([[:space:]]+|$)/ { inblock=1 }' in first
+assert r'/^[[:space:]]*[[:alpha:]][[:alnum:] .()_\/-]*:([[:space:]]+|$)/ { inblock=0 }' in first
+assert r'candidate !~ /^169\.254\./' in first
+assert 'journalctl -b -u systemd-networkd --no-pager -n 80' in first
 assert 'iwctl station wlan0 show' in first
 assert 'modprobe -r brcmfmac' not in first and 'modprobe -r brcmutil' not in first
 assert 'modprobe brcmfmac' not in first
@@ -87,17 +88,39 @@ assert 'systemctl restart systemd-resolved.service || fail' in first
 assert 'systemctl restart iwd.service || fail' in first
 assert 'systemctl restart systemd-networkd.service || fail' in first
 assert 'ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf' in first
-assert 'start_ssh()' in first
+assert 'start_ssh_best_effort()' in first and 'require_ssh()' in first
+assert 'install -d -m 0755 /run/sshd' in first
+assert first.index('install -d -m 0755 /run/sshd') < first.index('ssh-keygen -A')
+assert 'sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null' not in first
 assert 'systemctl start ssh.service || fail "unable to start SSH."' in first
 assert 'systemctl is-active --quiet ssh.service || fail "SSH did not become active."' in first
-assert first.index('start_ssh\nnote "SSH ready: $IPV4_ADDR"') < first.index('stage "07 FINALIZE"')
-assert first.index('start_ssh', first.index('finish_provisioning()')) < first.index('scrub_config_secrets', first.index('finish_provisioning()'))
+assert first.index('require_ssh\nnote "SSH reachable at: $IPV4_ADDR"') < first.index('stage "07 FINALIZE"')
+finish_start=first.index('finish_provisioning()')
+assert first.index('start_ssh_best_effort || true', finish_start) < first.index('scrub_config_secrets', finish_start)
+assert 'stage "90 RECOVERY: RETRY ROOT RESIZE"' in first
+assert 'stage "91 RECOVERY: FINALIZE INTERRUPTED FIRSTBOOT"' in first
+assert 'stage "02 RETRY ROOT RESIZE"' not in first and 'stage "02 FINALIZE INTERRUPTED FIRSTBOOT"' not in first
 assert 'command -v ip' not in first
 assert 'DefaultInterface=brcmfmac' not in first
 assert 'SaeDisable=brcmfmac' not in first
+assert 'PowerSaveDisable=brcmfmac' not in first
 assert 'bpi-zero-wifi.service' not in first
 assert not (root/'overlay/root/bpi-zero-wifi.service').exists()
 assert not (root/'overlay/root/bpi-zero-wifi-up.sh').exists()
+
+# Exercise the actual awk program embedded in ipv4_for_wlan0. It must scan
+# continuation lines, accept IPv4 with or without CIDR, and reject link-local.
+m=re.search(r"ipv4_for_wlan0\(\) \{.*?\| awk '(.+?)' \|\| true\n\}", first, re.S)
+assert m, 'unable to extract ipv4_for_wlan0 awk parser'
+awk_program=m.group(1)
+def parse_networkctl(sample: str) -> str:
+    r=subprocess.run(['awk', awk_program], input=sample, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+assert parse_networkctl("       Address: fe80::1/64\n                192.168.24.135\n       Gateway: 192.168.24.1\n") == '192.168.24.135'
+assert parse_networkctl("       Address: 192.168.24.135/24\n       Gateway: 192.168.24.1\n") == '192.168.24.135'
+assert parse_networkctl("       Address: fe80::1/64\n       Carrier Bound To: wlan0\n                192.168.24.135/24\n") == ''
+assert parse_networkctl("       Address: 169.254.12.7/16\n       Gateway: none\n") == ''
 
 # Offline runtime package set is exact and intentionally small.
 for pkg in ['iwd_3.8-2_armhf.deb','libell0_0.77-1_armhf.deb','libreadline8t64_8.2-6_armhf.deb','readline-common_8.2-6_all.deb','wireless-regdb_2026.05.30-1~deb13u1_all.deb']:
@@ -427,5 +450,22 @@ with tempfile.TemporaryDirectory() as td:
         assert 'malformed DTB' in str(exc)
     else:
         raise AssertionError('malformed DTB unexpectedly parsed')
+
+# SSH early-start regression: root password auth is explicit and sshd is active
+# before any Wi-Fi package/network stage begins.
+assert 'PermitRootLogin yes' in first
+assert 'PasswordAuthentication yes' in first
+assert 'PasswordAuthentication no' not in first
+assert 'Match User root' not in first
+ssh_stage3_start = first.index('if start_ssh_best_effort; then')
+assert ssh_stage3_start < first.index('stage "04 DEVICE IDENTITY + TIME"')
+assert ssh_stage3_start < first.index('stage "05 INSTALL WIFI USERSPACE"')
+assert ssh_stage3_start < first.index('stage "06 WIFI + DHCP"')
+assert 'note "SSH reachable at: $IPV4_ADDR"' in first
+
+assert 'sshd -T -C user=root,host=localhost,addr=127.0.0.1' in first
+assert 'effective SSH policy does not permit root login' in first
+assert 'effective SSH policy does not permit password authentication for root' in first
+assert 'SSH policy verified: root login=yes password authentication=yes.' in first
 
 print('3.13 Trixie platform contract checks passed')

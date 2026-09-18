@@ -35,7 +35,7 @@ Boot is verbose. Kernel, systemd and firstboot events remain visible.
 
 The image already contains the signed Debian regulatory database before first boot, so cfg80211 does not need to wait for firstboot package installation.
 
-Firstboot attempts root filesystem growth before credential validation. It then validates and sets the root password. Once Wi-Fi and DHCP succeed, firstboot writes the tty1 banner with the known `wlan0` interface, MAC and dynamic IPv4 field, and announces the resolved address.
+Firstboot attempts root filesystem growth before credential validation. It then validates and sets the root password, generates unique SSH host keys, validates the effective root/password SSH policy and starts SSH before Wi-Fi provisioning. Once Wi-Fi and DHCP succeed, firstboot writes the tty1 banner with the known `wlan0` interface, MAC and dynamic IPv4 field, rechecks SSH and announces the resolved address.
 
 Example:
 

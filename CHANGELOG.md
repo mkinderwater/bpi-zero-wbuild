@@ -1,3 +1,22 @@
+# 3.13 IPv4 / SSH hardening follow-up
+
+- Make `ipv4_for_wlan0` scan the full `networkctl` Address block, including continuation lines, instead of depending on IPv4 appearing on the labelled line.
+- Reject `169.254.0.0/16` link-local addresses as successful DHCP results.
+- Restore an explicit `/sys/class/net/wlan0` presence check with a hardware-specific failure message before DHCP waiting begins.
+- Restore `systemd-networkd` journal output to headless Wi-Fi failure diagnostics.
+- Remove the unused `WIFI_IF=wlan0` shell variable and the test that asserted dead code.
+- Make the early stage-03 SSH start best-effort, keep the post-DHCP SSH checkpoint fatal, and make the finalization recheck non-fatal so credential scrub/completion cannot be blocked by a transient SSH restart.
+- Give recovery branches unique stage identifiers (`90` and `91`) so log references are unambiguous.
+- Add executable regression coverage for IPv6-first Address blocks, plain/CIDR IPv4 forms and link-local rejection.
+- Keep the rollback Wi-Fi policy unchanged for now; the `PowerSaveDisable=brcmfmac` quirk remains intentionally absent pending runtime stability testing.
+
+# 3.13 SSH early-start authentication fix
+
+- Start and verify `ssh.service` immediately after root credentials, SSH policy and host keys are validated. SSH no longer waits for Wi-Fi or DHCP detection.
+- Make root password authentication explicit with `PermitRootLogin yes` and `PasswordAuthentication yes`; remove the unnecessary `Match User root` override.
+- Keep the post-DHCP SSH check as an idempotent reachability checkpoint and report the acquired IPv4 address.
+- Preserve the IPv4 parser fix accepting both plain IPv4 and CIDR output from `networkctl`.
+
 # 3.13 IPv4 detection + SSH availability fix
 
 - Accept both plain IPv4 (`192.168.24.135`) and CIDR (`192.168.24.135/24`) forms from `networkctl status`; the prior parser required CIDR and could report DHCP failure even after systemd-networkd had assigned an address.
